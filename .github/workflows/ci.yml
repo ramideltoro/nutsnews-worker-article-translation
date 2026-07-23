@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+
+      - name: Validate repository bootstrap
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -s README.md
+          test -s LICENSE
+          test -s SECURITY.md
+          test -s docs/repository-boundary.md
+          test -s .github/CODEOWNERS
+          test -s .github/PULL_REQUEST_TEMPLATE.md
+          test -s .github/dependabot.yml
+
+          grep -q "production-backend" README.md
+          grep -q "production-backend" docs/repository-boundary.md
+          grep -q "@ramideltoro" .github/CODEOWNERS

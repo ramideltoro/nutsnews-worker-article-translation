@@ -1,0 +1,33 @@
+name: Worker uplift task
+description: Track repo-local worker-uplift implementation work.
+title: "[Task] "
+labels:
+  - worker-uplift
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Repository boundary: Consume translation jobs, call the Qwen translation endpoint, validate translated fields and quality gates, and publish persistence jobs after successful translation.
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: What should change?
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: How will this be verified?
+    validations:
+      required: true
+  - type: checkboxes
+    id: guardrails
+    attributes:
+      label: Guardrails
+      options:
+        - label: No production secret is added to this repository.
+          required: true
+        - label: The legacy nutsnews-worker ingestion path remains untouched.
+          required: true
