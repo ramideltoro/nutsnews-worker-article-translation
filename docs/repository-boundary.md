@@ -28,7 +28,7 @@
 - CI validates repo boundary docs on every push and pull request.
 - CodeQL and dependency review workflows are present for future code-bearing changes.
 - Dependabot checks GitHub Actions and npm manifests.
-- Branch protection requires pull requests, CODEOWNER review, resolved conversations, and the `validate` status check where GitHub permits repository branch protection.
+- Branch protection requires pull requests, resolved conversations, and the `validate` status check where GitHub permits repository branch protection. CODEOWNERS documents ownership for reviews.
 
 ## Conditional Controls
 
