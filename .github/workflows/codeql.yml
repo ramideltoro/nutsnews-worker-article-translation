@@ -16,7 +16,6 @@ permissions:
 jobs:
   analyze:
     name: analyze
-    if: ${{ hashFiles('**/*.js', '**/*.jsx', '**/*.ts', '**/*.tsx') != '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
@@ -26,17 +25,43 @@ jobs:
           - javascript-typescript
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
 
+      - name: Detect analyzable source
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          has_code=false
+          while IFS= read -r file; do
+            case "$file" in
+              ./.git/*|./node_modules/*|./dist/*) continue ;;
+              *.js|*.jsx|*.ts|*.tsx)
+                has_code=true
+                break
+                ;;
+            esac
+          done < <(find . -type f)
+
+          echo "has_code=$has_code" >> "$GITHUB_OUTPUT"
+
+      - name: Skip until source exists
+        if: steps.source.outputs.has_code != 'true'
+        run: echo "No JavaScript or TypeScript source files are present yet."
+
       - name: Initialize CodeQL
+        if: steps.source.outputs.has_code == 'true'
         uses: github/codeql-action/init@v4
         with:
           languages: ${{ matrix.language }}
 
       - name: Autobuild
+        if: steps.source.outputs.has_code == 'true'
         uses: github/codeql-action/autobuild@v4
 
       - name: Analyze
+        if: steps.source.outputs.has_code == 'true'
         uses: github/codeql-action/analyze@v4
