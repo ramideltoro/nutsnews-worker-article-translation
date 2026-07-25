@@ -154,6 +154,51 @@ describe("createArticleTranslationWorkHandler", () => {
     expect(telemetryJson).not.toContain(context.qwenClient.requests[0]?.prompt.instructions);
   });
 
+  it("uses distinct broker message ids for per-article translation status commands", async () => {
+    const context = createTranslationContext();
+    const secondDelivery = {
+      envelope: createMinimalTranslationEnvelope({
+        messageId: "018f1598-2dd5-7c4f-9f92-8f7a7f8b4851",
+        idempotencyKey: "approval:translation:article-002",
+        aggregate: {
+          type: "article",
+          id: "article-002",
+          version: 1
+        }
+      }),
+      payload: createMinimalTranslationPayload({
+        pipelineRunId: "018f1598-2dd5-7c4f-9f92-8f7a7f8b3602",
+        stageExecutionId: "018f1598-2dd5-7c4f-9f92-8f7a7f8b4703",
+        sourceMessageId: "018f1598-2dd5-7c4f-9f92-8f7a7f8b4704",
+        idempotencyKey: "approval:translation:article-002",
+        articleId: "article-002"
+      }),
+      receivedAt: "2026-07-23T00:00:05.000Z"
+    };
+
+    await context.service.start();
+
+    await expect(context.broker.deliverTranslation()).resolves.toMatchObject({
+      action: "ack",
+      reason: "handled"
+    });
+    await expect(context.broker.deliverTranslation(secondDelivery)).resolves.toMatchObject({
+      action: "ack",
+      reason: "handled"
+    });
+
+    await context.service.stop();
+
+    const messages = statusCommands(context).map((command) => command.envelope.messageId);
+
+    expect(messages).toHaveLength(2);
+    expect(new Set(messages).size).toBe(2);
+    expect(statusCommands(context).map((command) => command.envelope.idempotencyKey)).toEqual([
+      "translation:result:article-001:1",
+      "translation:result:article-002:1"
+    ]);
+  });
+
   it("retries one transient language failure without rolling back or duplicating successful languages", async () => {
     const context = createTranslationContext();
 
@@ -585,7 +630,11 @@ function persistenceCommands(context: ReturnType<typeof createTranslationContext
 }
 
 function statusCommand(context: ReturnType<typeof createTranslationContext>) {
-  return context.broker.published.find((command) => command.payload.schemaId === STAGE_PAYLOAD_SCHEMA_IDS.translationResult);
+  return statusCommands(context)[0];
+}
+
+function statusCommands(context: ReturnType<typeof createTranslationContext>) {
+  return context.broker.published.filter((command) => command.payload.schemaId === STAGE_PAYLOAD_SCHEMA_IDS.translationResult);
 }
 
 function entityRef(command: ReturnType<typeof persistenceCommands>[number]) {

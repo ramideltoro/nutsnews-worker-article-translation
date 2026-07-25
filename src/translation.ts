@@ -659,7 +659,7 @@ function commandForPayload(
     route: "persistence",
     messageId: stableUuid([
       "persistence-message",
-      suffix
+      idempotencyKey
     ]),
     causationId: context.envelope.messageId,
     correlationId: context.envelope.correlationId,
