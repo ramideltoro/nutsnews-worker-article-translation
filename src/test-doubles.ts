@@ -528,7 +528,10 @@ function looksLikeSourceCopy(summary: string, sourceLanguage: string, targetLang
   }
 
   if (sourceLanguage === "en" && targetLanguage !== "en") {
-    return /\b(the|and|with|public-interest|summary|article|reporting)\b/iu.test(summary);
+    const englishPhraseLeakage = /\b(the\s+article|this\s+article|that\s+article|article\s+(reports?|describes?|contains?|is|has)|public-interest)\b/iu.test(summary);
+    const markerMatches = summary.match(/\b(the|and|with|summary|reporting)\b/giu) ?? [];
+
+    return englishPhraseLeakage || new Set(markerMatches.map((match) => match.toLowerCase())).size >= 2;
   }
 
   return false;
