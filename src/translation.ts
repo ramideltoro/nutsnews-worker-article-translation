@@ -36,7 +36,18 @@ export interface ArticleTranslationWorkHandlerOptions {
   readonly telemetry?: RuntimeTelemetrySink;
 }
 
-interface TranslationTaskInput {
+export type TranslationBacklogRecoveryResult = {
+  readonly status: "noop";
+  readonly completedLanguageCodes: readonly string[];
+  readonly missingLanguageCodes: readonly [];
+} | {
+  readonly status: "published";
+  readonly completedLanguageCodes: readonly string[];
+  readonly missingLanguageCodes: readonly string[];
+  readonly command: BrokerPublishCommand;
+};
+
+export interface TranslationTaskInput {
   readonly articleId: string;
   readonly articleVersion: number;
   readonly sourceLanguage: string;
@@ -74,6 +85,49 @@ export function createArticleTranslationWorkHandler(options: ArticleTranslationW
   return {
     name: "article-translation-work-handler",
     handle: (context, tools) => handleTranslation(context, tools, options)
+  };
+}
+
+export async function publishTranslationBacklogRecoveryTask(
+  context: RuntimeMessageContext,
+  request: TranslationTaskInput,
+  tools: TranslationWorkTools,
+  options: ArticleTranslationWorkHandlerOptions
+): Promise<TranslationBacklogRecoveryResult> {
+  const policy = await options.dependencies.languagePolicy.getPolicy();
+  const prompt = await options.dependencies.promptRegistry.getPrompt(options.config.qwen.promptId);
+  const targetLanguages = policy.requiredLanguageCodes.filter((language) => request.targetLanguages.includes(language));
+  const completedLanguageCodes: string[] = [];
+  const missingLanguageCodes: string[] = [];
+
+  for (const targetLanguage of targetLanguages) {
+    const existing = await tools.withTransaction((transaction) => options.dependencies.stateStore.findLanguageResult(languageKey(request, targetLanguage, prompt, options.config), transaction));
+
+    if (existing?.status === "success") {
+      completedLanguageCodes.push(targetLanguage);
+    } else {
+      missingLanguageCodes.push(targetLanguage);
+    }
+  }
+
+  if (missingLanguageCodes.length === 0) {
+    return {
+      status: "noop",
+      completedLanguageCodes,
+      missingLanguageCodes: []
+    };
+  }
+
+  const command = backlogRecoveryCommand(context, request, targetLanguages, completedLanguageCodes, prompt, options);
+  const receipt = await tools.publish(command);
+
+  await tools.recordOutbox(command, receipt);
+
+  return {
+    status: "published",
+    completedLanguageCodes,
+    missingLanguageCodes,
+    command
   };
 }
 
@@ -192,28 +246,70 @@ async function translateLanguage(
     };
   }
 
-  const validation = validateQwenTranslation(raw, options.config, elapsedMs(options, startedAtMs));
+  const validation = validateQwenTranslation(raw, elapsedMs(options, startedAtMs));
 
   if (validation.status !== "success") {
-    return {
-      status: "permanent_failure",
-      result: storedLanguageResult(context, input, targetLanguage, prompt, options.config, options.dependencies.clock, {
-        status: "permanent_failure",
-        failureReason: validation.reason,
-        qualityScore: validation.qualityScore,
-        latencyMs: validation.latencyMs
-      })
-    };
+    return qualityFailureOutcome(context, input, targetLanguage, prompt, options, validation.reason, validation.qualityScore, validation.latencyMs, true);
+  }
+
+  const quality = await options.dependencies.qualityValidator.validate({
+    sourceLanguage: input.sourceLanguage,
+    targetLanguage,
+    summary: validation.value.summary,
+    qualityScore: validation.value.qualityScore,
+    minQualityScore: options.config.quality.minScore,
+    minSummaryChars: options.config.quality.minSummaryChars,
+    maxSummaryChars: options.config.quality.maxSummaryChars
+  });
+
+  if (!quality.ok) {
+    return qualityFailureOutcome(context, input, targetLanguage, prompt, options, quality.reason, validation.value.qualityScore, validation.value.latencyMs, quality.retryable);
   }
 
   return {
     status: "success",
     result: storedLanguageResult(context, input, targetLanguage, prompt, options.config, options.dependencies.clock, {
       status: "success",
-      summary: validation.value.summary,
+      summary: quality.normalizedSummary,
       qualityScore: validation.value.qualityScore,
       usage: validation.value.usage,
       latencyMs: validation.value.latencyMs
+    })
+  };
+}
+
+async function qualityFailureOutcome(
+  context: RuntimeMessageContext,
+  input: TranslationTaskInput,
+  targetLanguage: string,
+  prompt: TranslationPrompt,
+  options: ArticleTranslationWorkHandlerOptions,
+  reason: string,
+  qualityScore: number,
+  latencyMs: number,
+  retryable: boolean
+): Promise<TranslationOutcome> {
+  const shouldRetry = retryable && context.envelope.attempt.count < options.config.quality.repromptMaxAttempts;
+
+  if (shouldRetry) {
+    await emitLanguageQualityRetryTelemetry(options, targetLanguage, prompt, reason, latencyMs);
+
+    return {
+      status: "retry",
+      result: {
+        status: "retry",
+        reason: `translation-quality-${normalizeReason(reason)}`
+      }
+    };
+  }
+
+  return {
+    status: "permanent_failure",
+    result: storedLanguageResult(context, input, targetLanguage, prompt, options.config, options.dependencies.clock, {
+      status: "permanent_failure",
+      failureReason: reason,
+      qualityScore,
+      latencyMs
     })
   };
 }
@@ -246,6 +342,94 @@ function qwenRequest(
       sourceLanguage: input.sourceLanguage,
       targetLanguage
     }
+  };
+}
+
+function backlogRecoveryCommand(
+  context: RuntimeMessageContext,
+  request: TranslationTaskInput,
+  targetLanguages: readonly string[],
+  existingLanguageCodes: readonly string[],
+  prompt: TranslationPrompt,
+  options: ArticleTranslationWorkHandlerOptions
+): BrokerPublishCommand {
+  const route = getWorkerRoute("translation");
+  const idempotencyKey = `translation:backlog:${request.articleId}:${String(request.articleVersion)}:${prompt.id}:${prompt.version}:${options.config.qwen.model}`;
+  const producedAt = runtimeNow(options.dependencies.clock);
+  const payload = {
+    schemaId: STAGE_PAYLOAD_SCHEMA_IDS.translationTask,
+    schemaVersion: STAGE_PAYLOAD_SCHEMA_VERSION,
+    pipelineRunId: request.pipelineRunId,
+    stageExecutionId: stableUuid([
+      "translation-backlog-stage",
+      request.articleId,
+      String(request.articleVersion),
+      prompt.id,
+      prompt.version,
+      options.config.qwen.model
+    ]),
+    sourceMessageId: context.envelope.messageId,
+    idempotencyKey,
+    traceparent: context.envelope.traceparent,
+    ...(context.envelope.tracestate === undefined ? {} : {
+      tracestate: context.envelope.tracestate
+    }),
+    producedAt,
+    articleId: request.articleId,
+    sourceLanguage: request.sourceLanguage,
+    targetLanguages,
+    reason: "backlog_recovery",
+    existingLanguageCodes
+  };
+  const validation = validateStagePayload(payload);
+
+  if (!validation.ok) {
+    throw new Error(`Invalid backlog recovery translation task payload: ${validation.issues.map((issue) => `${issue.path}:${issue.code}`).join(", ")}`);
+  }
+
+  return {
+    envelope: assertWorkerEnvelope({
+      schemaId: route.schemaId,
+      schemaVersion: 1,
+      route: "translation",
+      messageId: stableUuid([
+        "translation-backlog-message",
+        request.articleId,
+        String(request.articleVersion),
+        prompt.id,
+        prompt.version,
+        options.config.qwen.model
+      ]),
+      causationId: context.envelope.messageId,
+      correlationId: context.envelope.correlationId,
+      traceparent: context.envelope.traceparent,
+      ...(context.envelope.tracestate === undefined ? {} : {
+        tracestate: context.envelope.tracestate
+      }),
+      idempotencyKey,
+      aggregate: {
+        type: "article",
+        id: request.articleId,
+        version: request.articleVersion
+      },
+      occurredAt: producedAt,
+      attempt: {
+        count: 1,
+        max: WORKER_DELIVERY_BEHAVIOR.maxAttempts,
+        firstAttemptAt: producedAt
+      },
+      producer: {
+        name: options.config.serviceName,
+        version: options.config.serviceVersion
+      },
+      payloadRef: {
+        kind: "backend-record",
+        uri: `backend://worker-uplift/translation/${encodeURIComponent(request.articleId)}/backlog-recovery`,
+        mediaType: "application/json",
+        sizeBytes: getStagePayloadSizeBytes(payload)
+      }
+    }),
+    payload
   };
 }
 
@@ -515,7 +699,6 @@ function commandForPayload(
 
 function validateQwenTranslation(
   raw: unknown,
-  config: TranslationConfig,
   fallbackLatencyMs: number
 ): {
   readonly status: "success";
@@ -544,10 +727,6 @@ function validateQwenTranslation(
 
   if (SUMMARY_UNSAFE_RE.test(trimmed)) {
     return invalidTranslation("unsafe_summary_content", qualityScore, latencyMs);
-  }
-
-  if (qualityScore < config.quality.minScore) {
-    return invalidTranslation("translation_quality_below_threshold", qualityScore, latencyMs);
   }
 
   const parsedUsage = usage(raw.usage);
@@ -645,6 +824,37 @@ async function emitLanguageRetryTelemetry(
   error: TranslationQwenError,
   latencyMs: number
 ): Promise<void> {
+  await emitLanguageRetryEvent(options, targetLanguage, prompt, error.reason, latencyMs, {
+    retryable: true,
+    ...(error.retryAfterMs === undefined ? {} : {
+      retryAfterMs: error.retryAfterMs
+    })
+  });
+}
+
+async function emitLanguageQualityRetryTelemetry(
+  options: ArticleTranslationWorkHandlerOptions,
+  targetLanguage: string,
+  prompt: TranslationPrompt,
+  reason: string,
+  latencyMs: number
+): Promise<void> {
+  await emitLanguageRetryEvent(options, targetLanguage, prompt, reason, latencyMs, {
+    retryable: true
+  });
+}
+
+async function emitLanguageRetryEvent(
+  options: ArticleTranslationWorkHandlerOptions,
+  targetLanguage: string,
+  prompt: TranslationPrompt,
+  reason: string,
+  latencyMs: number,
+  retry: {
+    readonly retryable: boolean;
+    readonly retryAfterMs?: number;
+  }
+): Promise<void> {
   await emitRuntimeTelemetry(options.telemetry, {
     name: "runtime.dependency.observed",
     level: "warn",
@@ -662,11 +872,11 @@ async function emitLanguageRetryTelemetry(
       promptId: prompt.id,
       promptVersion: prompt.version,
       result: "retry",
-      retryReason: error.reason,
-      retryable: true,
+      retryReason: reason,
+      retryable: retry.retryable,
       latencyMs,
-      ...(error.retryAfterMs === undefined ? {} : {
-        retryAfterMs: error.retryAfterMs
+      ...(retry.retryAfterMs === undefined ? {} : {
+        retryAfterMs: retry.retryAfterMs
       }),
       reusedResult: false
     }

@@ -1,5 +1,6 @@
 import {
   STAGE_PAYLOAD_SCHEMA_IDS,
+  WORKER_DELIVERY_BEHAVIOR,
   validateStagePayload
 } from "@ramideltoro/nutsnews-worker-contracts";
 import {
@@ -12,7 +13,10 @@ import {
 } from "vitest";
 
 import { loadTranslationConfig } from "../src/config.js";
-import { TranslationQwenError } from "../src/dependencies.js";
+import {
+  TranslationQwenError,
+  type TranslationWorkTools
+} from "../src/dependencies.js";
 import { createTranslationPrometheusMetricsSink } from "../src/metrics.js";
 import { createTranslationService } from "../src/service.js";
 import {
@@ -25,7 +29,11 @@ import {
   createMinimalTranslationEnvelope,
   createMinimalTranslationPayload
 } from "../src/test-doubles.js";
-import { createArticleTranslationWorkHandler } from "../src/translation.js";
+import {
+  createArticleTranslationWorkHandler,
+  publishTranslationBacklogRecoveryTask,
+  type TranslationTaskInput
+} from "../src/translation.js";
 
 describe("createArticleTranslationWorkHandler", () => {
   it("fans out accepted articles into validated per-language Qwen results and persistence commands", async () => {
@@ -202,6 +210,53 @@ describe("createArticleTranslationWorkHandler", () => {
     });
   });
 
+  it("bounds quality re-prompts and resumes without redoing earlier successful languages", async () => {
+    const context = createTranslationContext();
+
+    context.qwenClient.responsesByLanguage.set("ja", {
+      summary: "The article reports a useful public-interest development with details.",
+      qualityScore: 42,
+      latencyMs: 19
+    });
+
+    await context.service.start();
+
+    await expect(context.broker.deliverTranslation()).resolves.toMatchObject({
+      action: "retry",
+      reason: "translation-quality-translation_quality_below_threshold"
+    });
+
+    expect(context.stateStore.languageResults).toHaveLength(1);
+    expect(context.stateStore.languageResults[0]).toMatchObject({
+      targetLanguage: "fr",
+      status: "success"
+    });
+    expect(context.metrics.collect()).toContain('result="retry"');
+
+    context.qwenClient.responsesByLanguage.delete("ja");
+
+    await expect(context.broker.deliverTranslation(retryDelivery(2))).resolves.toMatchObject({
+      action: "ack",
+      reason: "handled"
+    });
+
+    await context.service.stop();
+
+    expect(context.qwenClient.requests.map((request) => request.input.targetLanguage)).toEqual([
+      "fr",
+      "ja",
+      "ja",
+      "de-CH",
+      "de",
+      "el"
+    ]);
+    expect(persistenceCommands(context).filter((command) => entityRef(command).targetLanguage === "fr")).toHaveLength(1);
+    expect(statusCommand(context)?.payload).toMatchObject({
+      translationStatus: "complete",
+      missingLanguageCodes: []
+    });
+  });
+
   it("does not resubmit already successful article-version-language-prompt-model combinations on replay", async () => {
     const context = createTranslationContext();
 
@@ -238,18 +293,18 @@ describe("createArticleTranslationWorkHandler", () => {
     expect(context.broker.published).toHaveLength(firstPublishedCount + 1);
   });
 
-  it("records one permanent language failure without suppressing successful languages", async () => {
+  it("records one permanent language failure after quality re-prompt attempts are exhausted", async () => {
     const context = createTranslationContext();
 
     context.qwenClient.responsesByLanguage.set("ja", {
-      summary: "Too weak to publish.",
+      summary: "この記事は、地域社会に役立つ進展を具体的に伝えています。",
       qualityScore: 42,
       latencyMs: 19
     });
 
     await context.service.start();
 
-    await expect(context.broker.deliverTranslation()).resolves.toMatchObject({
+    await expect(context.broker.deliverTranslation(retryDelivery(2))).resolves.toMatchObject({
       action: "ack",
       reason: "handled"
     });
@@ -279,6 +334,97 @@ describe("createArticleTranslationWorkHandler", () => {
         "ja"
       ]
     });
+  });
+
+  it("publishes backlog recovery tasks for missing durable language results only", async () => {
+    const context = createTranslationContext();
+    const initialFrOnly = {
+      envelope: createMinimalTranslationEnvelope({
+        messageId: "018f1598-2dd5-7c4f-9f92-8f7a7f8b4831",
+        idempotencyKey: "approval:translation:article-001:fr-only"
+      }),
+      payload: createMinimalTranslationPayload({
+        idempotencyKey: "approval:translation:article-001:fr-only",
+        targetLanguages: [
+          "fr"
+        ]
+      }),
+      receivedAt: "2026-07-23T00:00:04.000Z"
+    };
+
+    await context.service.start();
+
+    await expect(context.broker.deliverTranslation(initialFrOnly)).resolves.toMatchObject({
+      action: "ack",
+      reason: "handled"
+    });
+
+    const recovery = await publishTranslationBacklogRecoveryTask(backlogContext(), backlogRequest(), workTools(context), {
+      config: context.config,
+      dependencies: context.dependencies,
+      telemetry: context.telemetryAndMetrics
+    });
+
+    expect(recovery).toMatchObject({
+      status: "published",
+      completedLanguageCodes: [
+        "fr"
+      ],
+      missingLanguageCodes: [
+        "ja",
+        "de-CH",
+        "de",
+        "el"
+      ]
+    });
+
+    if (recovery.status !== "published") {
+      throw new Error("Expected backlog recovery task to publish.");
+    }
+
+    expect(recovery.command.payload).toMatchObject({
+      schemaId: STAGE_PAYLOAD_SCHEMA_IDS.translationTask,
+      reason: "backlog_recovery",
+      existingLanguageCodes: [
+        "fr"
+      ]
+    });
+
+    await expect(context.broker.deliverTranslation({
+      envelope: recovery.command.envelope,
+      payload: recovery.command.payload,
+      receivedAt: "2026-07-23T00:00:05.000Z"
+    })).resolves.toMatchObject({
+      action: "ack",
+      reason: "handled"
+    });
+
+    const noop = await publishTranslationBacklogRecoveryTask(backlogContext(), backlogRequest(), workTools(context), {
+      config: context.config,
+      dependencies: context.dependencies,
+      telemetry: context.telemetryAndMetrics
+    });
+
+    await context.service.stop();
+
+    expect(noop).toMatchObject({
+      status: "noop",
+      missingLanguageCodes: []
+    });
+    expect(context.qwenClient.requests.map((request) => request.input.targetLanguage)).toEqual([
+      "fr",
+      "ja",
+      "de-CH",
+      "de",
+      "el"
+    ]);
+    expect(context.stateStore.languageResults.map((result) => result.targetLanguage)).toEqual([
+      "fr",
+      "ja",
+      "de-CH",
+      "de",
+      "el"
+    ]);
   });
 
   it("skips languages already present on the translation task", async () => {
@@ -367,12 +513,70 @@ function createTranslationContext() {
   return {
     broker: dependencies.brokerTransport as LocalBrokerTransport,
     config,
+    dependencies,
     metrics,
     outbox: dependencies.brokerOutbox as LocalTranslationBrokerOutbox,
     qwenClient: dependencies.qwenClient as LocalTranslationQwenClient,
     service,
     stateStore: dependencies.stateStore as InMemoryTranslationStateStore,
-    telemetry
+    telemetry,
+    telemetryAndMetrics
+  };
+}
+
+function retryDelivery(attemptCount: number) {
+  const occurredAt = "2026-07-23T00:00:00.000Z";
+
+  return {
+    envelope: createMinimalTranslationEnvelope({
+      attempt: {
+        count: attemptCount,
+        max: WORKER_DELIVERY_BEHAVIOR.maxAttempts,
+        firstAttemptAt: occurredAt
+      }
+    }),
+    payload: createMinimalTranslationPayload(),
+    receivedAt: "2026-07-23T00:00:02.000Z"
+  };
+}
+
+function backlogContext() {
+  return {
+    envelope: createMinimalTranslationEnvelope({
+      messageId: "018f1598-2dd5-7c4f-9f92-8f7a7f8b4841",
+      idempotencyKey: "translation:backlog:article-001"
+    }),
+    payload: createMinimalTranslationPayload({
+      idempotencyKey: "translation:backlog:article-001",
+      reason: "backlog_recovery"
+    }),
+    stage: "translation" as const,
+    receivedAt: "2026-07-23T00:00:04.000Z"
+  };
+}
+
+function backlogRequest(): TranslationTaskInput {
+  return {
+    articleId: "article-001",
+    articleVersion: 1,
+    sourceLanguage: "en",
+    targetLanguages: [
+      "fr",
+      "ja",
+      "de-CH",
+      "de",
+      "el"
+    ],
+    existingLanguageCodes: [],
+    pipelineRunId: "018f1598-2dd5-7c4f-9f92-8f7a7f8b3601"
+  };
+}
+
+function workTools(context: ReturnType<typeof createTranslationContext>): TranslationWorkTools {
+  return {
+    publish: (command) => context.service.broker.publish(command),
+    recordOutbox: (command, receipt) => context.outbox.record(command, receipt),
+    withTransaction: <T>(operation: Parameters<TranslationWorkTools["withTransaction"]>[0]) => context.dependencies.transactionRunner.withTransaction(operation) as Promise<T>
   };
 }
 

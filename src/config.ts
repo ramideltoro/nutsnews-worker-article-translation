@@ -1,5 +1,7 @@
 import os from "node:os";
 
+import { WORKER_DELIVERY_BEHAVIOR } from "@ramideltoro/nutsnews-worker-contracts";
+
 export const TRANSLATION_SERVICE_NAME = "nutsnews-worker-article-translation" as const;
 export const TRANSLATION_SERVICE_VERSION = "0.1.0" as const;
 
@@ -28,7 +30,10 @@ export const TRANSLATION_CONFIG_SCHEMA = [
   variable("NUTSNEWS_TRANSLATION_LANGUAGE_POLICY_ID", "Versioned language policy identifier.", false, false, "required-summaries-v1"),
   variable("NUTSNEWS_TRANSLATION_TARGET_LANGUAGES", "Comma-separated required summary language codes.", false, false, "fr,ja,de-CH,de,el"),
   variable("NUTSNEWS_TRANSLATION_PER_LANGUAGE_CONCURRENCY", "Maximum concurrent translation calls for one target language.", false, false, "1"),
-  variable("NUTSNEWS_TRANSLATION_QUALITY_MIN_SCORE", "Minimum bounded translation quality score for future validators.", false, false, "80"),
+  variable("NUTSNEWS_TRANSLATION_QUALITY_MIN_SCORE", "Minimum bounded translation quality score accepted by quality validation.", false, false, "80"),
+  variable("NUTSNEWS_TRANSLATION_SUMMARY_MIN_CHARS", "Minimum translated summary length accepted by quality validation.", false, false, "24"),
+  variable("NUTSNEWS_TRANSLATION_SUMMARY_MAX_CHARS", "Maximum translated summary length accepted by quality validation.", false, false, "420"),
+  variable("NUTSNEWS_TRANSLATION_QUALITY_REPROMPT_MAX_ATTEMPTS", "Maximum delivery attempts used for retryable quality re-prompts before permanent failure.", false, false, "2"),
   variable("NUTSNEWS_TRANSLATION_CONCURRENCY", "Maximum concurrent translation message handlers.", false, false, "2"),
   variable("NUTSNEWS_TRANSLATION_PREFETCH", "Broker prefetch bound for translation deliveries.", false, false, "4"),
   variable("NUTSNEWS_TRANSLATION_QWEN_TOTAL_TIMEOUT_MS", "Maximum translation endpoint call timeout in milliseconds.", false, false, "30000"),
@@ -68,6 +73,9 @@ export interface TranslationConfig {
   };
   readonly quality: {
     readonly minScore: number;
+    readonly minSummaryChars: number;
+    readonly maxSummaryChars: number;
+    readonly repromptMaxAttempts: number;
   };
   readonly concurrency: number;
   readonly prefetch: number;
@@ -129,7 +137,10 @@ export function loadTranslationConfig(env: NodeJS.ProcessEnv = process.env): Tra
       perLanguageConcurrency: parseInteger(env.NUTSNEWS_TRANSLATION_PER_LANGUAGE_CONCURRENCY, "NUTSNEWS_TRANSLATION_PER_LANGUAGE_CONCURRENCY", 1, 1, 8, issues)
     },
     quality: {
-      minScore: parseInteger(env.NUTSNEWS_TRANSLATION_QUALITY_MIN_SCORE, "NUTSNEWS_TRANSLATION_QUALITY_MIN_SCORE", 80, 0, 100, issues)
+      minScore: parseInteger(env.NUTSNEWS_TRANSLATION_QUALITY_MIN_SCORE, "NUTSNEWS_TRANSLATION_QUALITY_MIN_SCORE", 80, 0, 100, issues),
+      minSummaryChars: parseInteger(env.NUTSNEWS_TRANSLATION_SUMMARY_MIN_CHARS, "NUTSNEWS_TRANSLATION_SUMMARY_MIN_CHARS", 24, 1, 1_000, issues),
+      maxSummaryChars: parseInteger(env.NUTSNEWS_TRANSLATION_SUMMARY_MAX_CHARS, "NUTSNEWS_TRANSLATION_SUMMARY_MAX_CHARS", 420, 24, 2_000, issues),
+      repromptMaxAttempts: parseInteger(env.NUTSNEWS_TRANSLATION_QUALITY_REPROMPT_MAX_ATTEMPTS, "NUTSNEWS_TRANSLATION_QUALITY_REPROMPT_MAX_ATTEMPTS", 2, 1, WORKER_DELIVERY_BEHAVIOR.maxAttempts, issues)
     },
     concurrency,
     prefetch,
@@ -145,6 +156,10 @@ export function loadTranslationConfig(env: NodeJS.ProcessEnv = process.env): Tra
 
   if (config.languagePolicy.perLanguageConcurrency > config.concurrency) {
     issues.push("NUTSNEWS_TRANSLATION_PER_LANGUAGE_CONCURRENCY must be less than or equal to NUTSNEWS_TRANSLATION_CONCURRENCY.");
+  }
+
+  if (config.quality.minSummaryChars > config.quality.maxSummaryChars) {
+    issues.push("NUTSNEWS_TRANSLATION_SUMMARY_MIN_CHARS must be less than or equal to NUTSNEWS_TRANSLATION_SUMMARY_MAX_CHARS.");
   }
 
   if (!config.shadowMode) {

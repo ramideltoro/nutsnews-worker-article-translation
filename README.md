@@ -6,14 +6,17 @@ Deployable worker-uplift translation service shell for NutsNews.
 
 Consume translation jobs, fan accepted articles into per-language Qwen translation calls, validate translated summaries and quality gates, and publish persistence jobs after successful language results.
 
-The worker records one independently replayable result per article version, source language, target language, prompt version, and model. Already successful combinations are reused on replay, while transient Qwen failures retry only the failed language path and do not roll back successfully persisted languages.
+The worker records one independently replayable result per article version, source language, target language, prompt version, and model. Already successful combinations are reused on replay, while transient Qwen or retryable quality failures retry only the failed language path and do not roll back successfully persisted languages.
 
 ## Runtime Surface
 
 - Consumes the contracted `translation` route and asserts the downstream `persistence` route.
 - Accepts `translationTask` payloads whose contract consumer is `translation`.
 - Resolves the configured summary-translation prompt and required language policy before Qwen calls.
+- Enforces deterministic quality gates for empty output, length bounds, source-copy leakage, target script expectations, boilerplate, encoding, summary policy, and quality score threshold.
+- Bounds quality re-prompts with `NUTSNEWS_TRANSLATION_QUALITY_REPROMPT_MAX_ATTEMPTS`; exhausted retryable quality failures become audited permanent language failures, never persistence inputs.
 - Publishes one `persistenceCommand` per successful language summary and one `translationResult` status event after the language set is processed.
+- Exposes `publishTranslationBacklogRecoveryTask` for reconciliation jobs to republish idempotent `backlog_recovery` translation tasks from durable language-result state without redoing valid languages.
 - Provides injectable Qwen client, prompt registry, language policy, quality validator, durable state, transaction, outbox, broker, and work-handler boundaries.
 - Configures low default prefetch and concurrency, plus per-language concurrency for Qwen-bound translation work.
 - Uses shared runtime broker lifecycle, in-flight drain, idempotency store, retry/DLQ destinations, health reports, and Prometheus metrics.
@@ -37,6 +40,9 @@ The HTTP server exposes `/config-schema` with names, defaults, sensitivity, and 
 | `NUTSNEWS_TRANSLATION_TARGET_LANGUAGES` | `fr,ja,de-CH,de,el` | optional | no |
 | `NUTSNEWS_TRANSLATION_PER_LANGUAGE_CONCURRENCY` | `1` | optional | no |
 | `NUTSNEWS_TRANSLATION_QUALITY_MIN_SCORE` | `80` | optional | no |
+| `NUTSNEWS_TRANSLATION_SUMMARY_MIN_CHARS` | `24` | optional | no |
+| `NUTSNEWS_TRANSLATION_SUMMARY_MAX_CHARS` | `420` | optional | no |
+| `NUTSNEWS_TRANSLATION_QUALITY_REPROMPT_MAX_ATTEMPTS` | `2` | optional | no |
 | `NUTSNEWS_TRANSLATION_CONCURRENCY` | `2` | optional | no |
 | `NUTSNEWS_TRANSLATION_PREFETCH` | `4` | optional | no |
 | `NUTSNEWS_TRANSLATION_SHADOW_MODE` | `true` | must remain true here | no |

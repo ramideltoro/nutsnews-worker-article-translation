@@ -39,7 +39,10 @@ describe("loadTranslationConfig", () => {
         perLanguageConcurrency: 1
       },
       quality: {
-        minScore: 80
+        minScore: 80,
+        minSummaryChars: 24,
+        maxSummaryChars: 420,
+        repromptMaxAttempts: 2
       },
       shadowMode: true,
       dependencies: {
@@ -84,6 +87,9 @@ describe("loadTranslationConfig", () => {
       NUTSNEWS_TRANSLATION_QWEN_MAX_INPUT_BYTES: "16",
       NUTSNEWS_TRANSLATION_PER_LANGUAGE_CONCURRENCY: "9",
       NUTSNEWS_TRANSLATION_QUALITY_MIN_SCORE: "120",
+      NUTSNEWS_TRANSLATION_SUMMARY_MIN_CHARS: "500",
+      NUTSNEWS_TRANSLATION_SUMMARY_MAX_CHARS: "100",
+      NUTSNEWS_TRANSLATION_QUALITY_REPROMPT_MAX_ATTEMPTS: "99",
       NUTSNEWS_TRANSLATION_SHADOW_MODE: "false"
     })).toThrow(TranslationConfigError);
   });
@@ -94,7 +100,10 @@ describe("loadTranslationConfig", () => {
       NUTSNEWS_TRANSLATION_LANGUAGE_POLICY_ID: "required-summaries-v2",
       NUTSNEWS_TRANSLATION_TARGET_LANGUAGES: "fr, ja, fr, de",
       NUTSNEWS_TRANSLATION_PER_LANGUAGE_CONCURRENCY: "2",
-      NUTSNEWS_TRANSLATION_QUALITY_MIN_SCORE: "85"
+      NUTSNEWS_TRANSLATION_QUALITY_MIN_SCORE: "85",
+      NUTSNEWS_TRANSLATION_SUMMARY_MIN_CHARS: "32",
+      NUTSNEWS_TRANSLATION_SUMMARY_MAX_CHARS: "500",
+      NUTSNEWS_TRANSLATION_QUALITY_REPROMPT_MAX_ATTEMPTS: "3"
     });
 
     expect(config.qwen.promptId).toBe("summary-translation-v2");
@@ -108,7 +117,10 @@ describe("loadTranslationConfig", () => {
       perLanguageConcurrency: 2
     });
     expect(config.quality).toEqual({
-      minScore: 85
+      minScore: 85,
+      minSummaryChars: 32,
+      maxSummaryChars: 500,
+      repromptMaxAttempts: 3
     });
   });
 
