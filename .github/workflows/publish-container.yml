@@ -51,10 +51,14 @@ jobs:
       - name: Build and push SHA-tagged image
         if: steps.dockerfile.outputs.has_dockerfile == 'true'
         uses: docker/build-push-action@v7
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           context: .
           push: true
           tags: ${{ env.IMAGE }}
+          secrets: |
+            npm_token=${{ secrets.GITHUB_TOKEN }}
           labels: |
             org.opencontainers.image.source=https://github.com/ramideltoro/nutsnews-worker-article-translation
             org.opencontainers.image.revision=${{ github.sha }}

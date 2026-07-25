@@ -5,7 +5,7 @@
 | Repository | `ramideltoro/nutsnews-worker-article-translation` |
 | Owner | `@ramideltoro` |
 | Responsibility | Consume translation jobs, call the Qwen translation endpoint, validate translated fields and quality gates, and publish persistence jobs after successful translation. |
-| Deployable / package type | Deployable service repo. Publishes immutable SHA-tagged images to `ghcr.io/ramideltoro/nutsnews-worker-article-translation` after implementation work adds a Dockerfile. |
+| Deployable / package type | Deployable service repo. Publishes immutable SHA-tagged images to `ghcr.io/ramideltoro/nutsnews-worker-article-translation`. |
 | Primary artifact | Signed GHCR image tagged only by commit SHA |
 | Support boundary | Repo-local code, tests, CI, package/image publishing, and service-local run notes. |
 | Outside boundary | Backend host runtime/deployments, Grafana Cloud resources, explanatory architecture/operations docs, production secrets, legacy ingestion. |

@@ -1,0 +1,62 @@
+{
+  "name": "@ramideltoro/nutsnews-worker-article-translation",
+  "version": "0.1.0",
+  "description": "Deployable worker-uplift article translation service shell for NutsNews.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ramideltoro/nutsnews-worker-article-translation.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ramideltoro/nutsnews-worker-article-translation/issues"
+  },
+  "homepage": "https://github.com/ramideltoro/nutsnews-worker-article-translation#readme",
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "clean": "rm -rf dist coverage *.tgz *.sbom.json",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "test:integration": "vitest run --config vitest.integration.config.ts",
+    "sbom": "npm sbom --sbom-format=cyclonedx > nutsnews-worker-article-translation.sbom.json",
+    "audit:prod": "npm audit --omit=dev --audit-level=high",
+    "container:build": "docker build --pull=false --secret id=npm_token,env=NODE_AUTH_TOKEN -t nutsnews-worker-article-translation:local .",
+    "ci": "npm run lint && npm run typecheck && npm run test && npm run test:integration && npm run build && npm run sbom && npm run audit:prod"
+  },
+  "dependencies": {
+    "@ramideltoro/nutsnews-worker-contracts": "0.4.0",
+    "@ramideltoro/nutsnews-worker-runtime": "0.4.0"
+  },
+  "overrides": {
+    "@ramideltoro/nutsnews-worker-runtime": {
+      "@ramideltoro/nutsnews-worker-contracts": "0.4.0"
+    }
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.32.0",
+    "@types/node": "^24.1.0",
+    "eslint": "^9.32.0",
+    "typescript": "^5.8.3",
+    "typescript-eslint": "^8.38.0",
+    "vitest": "^3.2.4"
+  },
+  "packageManager": "npm@11.13.0",
+  "engines": {
+    "node": ">=24"
+  }
+}

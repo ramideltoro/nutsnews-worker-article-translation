@@ -2,7 +2,7 @@
 
 Image: `ghcr.io/ramideltoro/nutsnews-worker-article-translation:<commit-sha>`
 
-The publish workflow signs and pushes immutable SHA-tagged images after implementation adds a Dockerfile. It does not publish mutable `latest` tags.
+The publish workflow signs and pushes immutable SHA-tagged images. It does not publish mutable `latest` tags.
 
 The intended production package consumer is:
 
