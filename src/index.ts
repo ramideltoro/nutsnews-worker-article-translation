@@ -13,8 +13,10 @@ import {
   loadTranslationConfig,
   type TranslationConfig
 } from "./config.js";
+import type { TranslationDependencies } from "./dependencies.js";
 import { createTranslationHttpServer } from "./http.js";
 import { createTranslationPrometheusMetricsSink } from "./metrics.js";
+import { createProductionTranslationDependencies } from "./production.js";
 import { createTranslationService } from "./service.js";
 import { createLocalTranslationDependencies } from "./test-doubles.js";
 import { createArticleTranslationWorkHandler } from "./translation.js";
@@ -60,6 +62,17 @@ export {
   createTranslationPrometheusMetricsSink,
   type TranslationPrometheusMetricsSink
 } from "./metrics.js";
+export {
+  LocalAiTranslationQwenClient,
+  PayloadRabbitMqTransport,
+  PostgresTranslationBrokerOutbox,
+  PostgresTranslationStateStore,
+  PostgresTranslationTransactionRunner,
+  StaticTranslationLanguagePolicy,
+  StaticTranslationPromptRegistry,
+  createProductionTranslationDependencies,
+  type ProductionTranslationDependencies
+} from "./production.js";
 export {
   createTranslationService,
   type TranslationService
@@ -115,9 +128,14 @@ export function createTranslationApplication(config = loadTranslationConfig()): 
       })
     : undefined;
   const telemetry = combineTelemetrySinks(logSink, metrics);
-  const baseDependencies = createLocalTranslationDependencies({
-    clock: SYSTEM_RUNTIME_CLOCK
-  });
+  const baseDependencies = config.dependencyMode === "production"
+    ? createProductionTranslationDependencies({
+        config,
+        clock: SYSTEM_RUNTIME_CLOCK
+      })
+    : createLocalTranslationDependencies({
+        clock: SYSTEM_RUNTIME_CLOCK
+      });
   const dependencies = {
     ...baseDependencies,
     workHandler: createArticleTranslationWorkHandler({
@@ -152,6 +170,11 @@ export function createTranslationApplication(config = loadTranslationConfig()): 
       },
       async () => {
         await service.stop();
+      },
+      async () => {
+        if (hasDependencyCloser(baseDependencies)) {
+          await baseDependencies.close();
+        }
       }
     ],
     signalSource: process,
@@ -176,6 +199,14 @@ export function createTranslationApplication(config = loadTranslationConfig()): 
       await shutdown.trigger("manual");
     }
   };
+}
+
+function hasDependencyCloser(
+  dependencies: TranslationDependencies
+): dependencies is TranslationDependencies & { readonly close: () => Promise<void> } {
+  const candidate = dependencies as Partial<{ readonly close: unknown }>;
+
+  return typeof candidate.close === "function";
 }
 
 function combineTelemetrySinks(
