@@ -40,6 +40,8 @@ import type {
   TranslationPrompt,
   TranslationPromptRegistry,
   TranslationQualityValidator,
+  TranslationQualityValidationRequest,
+  TranslationQualityValidationResult,
   TranslationQwenClient,
   TranslationQwenRequest,
   TranslationStateStore,
@@ -185,17 +187,8 @@ export class LocalTranslationQwenClient implements TranslationQwenClient {
   readonly requests: TranslationQwenRequest[] = [];
   readonly responsesByLanguage = new Map<string, unknown>();
   readonly errorsByLanguage = new Map<string, unknown>();
-  response: unknown = {
-    summary: "Translated public-interest summary with enough detail for publication.",
-    qualityScore: 93,
-    latencyMs: 41,
-    usage: {
-      inputTokens: 120,
-      outputTokens: 38,
-      totalTokens: 158
-    }
-  };
-  error: unknown;
+  response: unknown = undefined;
+  error: unknown = undefined;
 
   probe(): TranslationDependencyProbe {
     return {
@@ -217,7 +210,7 @@ export class LocalTranslationQwenClient implements TranslationQwenClient {
       return Promise.reject(toError(this.error));
     }
 
-    return Promise.resolve(this.responsesByLanguage.get(request.input.targetLanguage) ?? this.response);
+    return Promise.resolve(this.responsesByLanguage.get(request.input.targetLanguage) ?? this.response ?? defaultQwenResponse(request.input.targetLanguage));
   }
 }
 
@@ -290,6 +283,61 @@ export class LocalTranslationQualityValidator implements TranslationQualityValid
     return {
       status: this.status,
       summary: this.status === "ok" ? "local quality validator ready" : "local quality validator degraded"
+    };
+  }
+
+  validate(request: TranslationQualityValidationRequest): TranslationQualityValidationResult {
+    const normalizedSummary = request.summary.trim().replace(/\s+/gu, " ");
+    const length = Array.from(normalizedSummary).length;
+
+    if (normalizedSummary.length === 0) {
+      return invalidQuality("empty_summary", true);
+    }
+
+    if (length < request.minSummaryChars) {
+      return invalidQuality("summary_too_short", true);
+    }
+
+    if (length > request.maxSummaryChars) {
+      return invalidQuality("summary_too_long", true);
+    }
+
+    if (normalizedSummary.includes("\uFFFD") || hasDisallowedControlCharacter(normalizedSummary)) {
+      return invalidQuality("encoding_error", true);
+    }
+
+    if (/^(as an ai|i cannot|sorry|translation:|here is|here's)/iu.test(normalizedSummary)) {
+      return invalidQuality("prohibited_boilerplate", true);
+    }
+
+    if (/https?:\/\/|^#|\n[-*]\s/u.test(normalizedSummary)) {
+      return invalidQuality("summary_policy_violation", true);
+    }
+
+    if (request.qualityScore < request.minQualityScore) {
+      return invalidQuality("translation_quality_below_threshold", true);
+    }
+
+    if (looksLikeSourceCopy(normalizedSummary, request.sourceLanguage, request.targetLanguage)) {
+      return invalidQuality("source_copy_leakage", true);
+    }
+
+    if (!matchesTargetScript(normalizedSummary, request.targetLanguage)) {
+      return invalidQuality("target_language_script_mismatch", true);
+    }
+
+    return {
+      ok: true,
+      normalizedSummary,
+      auditCodes: [
+        "non_empty",
+        "length_bounds",
+        "encoding",
+        "boilerplate",
+        "summary_policy",
+        "quality_score",
+        "target_language"
+      ]
     };
   }
 }
@@ -422,6 +470,92 @@ function languageResultMatches(
 
 function toError(value: unknown): Error {
   return value instanceof Error ? value : new Error(String(value));
+}
+
+function defaultQwenResponse(targetLanguage: string): unknown {
+  const summaries = new Map<string, string>([
+    [
+      "fr",
+      "Le rapport decrit une avancee utile pour le public avec des details suffisants pour publication."
+    ],
+    [
+      "ja",
+      "この記事は、地域社会に役立つ進展を具体的に伝えています。"
+    ],
+    [
+      "de-CH",
+      "Der Bericht beschreibt eine konkrete Entwicklung mit klarem Nutzen fuer die Oeffentlichkeit."
+    ],
+    [
+      "de",
+      "Der Bericht beschreibt eine konkrete Entwicklung mit erkennbarem Nutzen fuer die Oeffentlichkeit."
+    ],
+    [
+      "el",
+      "Το άρθρο περιγράφει μια χρήσιμη εξέλιξη για το κοινό με σαφείς λεπτομέρειες."
+    ]
+  ]);
+
+  return {
+    summary: summaries.get(targetLanguage) ?? "Le rapport decrit une avancee utile avec des details suffisants pour publication.",
+    qualityScore: 93,
+    latencyMs: 41,
+    usage: {
+      inputTokens: 120,
+      outputTokens: 38,
+      totalTokens: 158
+    }
+  };
+}
+
+function invalidQuality(
+  reason: Extract<TranslationQualityValidationResult, { readonly ok: false }>["reason"],
+  retryable: boolean
+): TranslationQualityValidationResult {
+  return {
+    ok: false,
+    reason,
+    retryable,
+    auditCodes: [
+      reason
+    ]
+  };
+}
+
+function looksLikeSourceCopy(summary: string, sourceLanguage: string, targetLanguage: string): boolean {
+  if (sourceLanguage === targetLanguage) {
+    return true;
+  }
+
+  if (sourceLanguage === "en" && targetLanguage !== "en") {
+    return /\b(the|and|with|public-interest|summary|article|reporting)\b/iu.test(summary);
+  }
+
+  return false;
+}
+
+function matchesTargetScript(summary: string, targetLanguage: string): boolean {
+  if (targetLanguage === "ja") {
+    return /[\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Han}]/u.test(summary);
+  }
+
+  if (targetLanguage === "el") {
+    return /\p{Script=Greek}/u.test(summary);
+  }
+
+  return true;
+}
+
+function hasDisallowedControlCharacter(value: string): boolean {
+  for (const character of value) {
+    const codePoint = character.codePointAt(0);
+
+    if (codePoint !== undefined && ((codePoint >= 0 && codePoint <= 8) || codePoint === 11 || codePoint === 12 || (codePoint >= 14 && codePoint <= 31))) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 export function createMinimalTranslationEnvelope(overrides: Partial<WorkerMessageEnvelope> = {}): WorkerMessageEnvelope {

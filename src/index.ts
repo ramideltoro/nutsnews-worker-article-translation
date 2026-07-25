@@ -40,6 +40,8 @@ export type {
   TranslationPrompt,
   TranslationPromptRegistry,
   TranslationQualityValidator,
+  TranslationQualityValidationRequest,
+  TranslationQualityValidationResult,
   TranslationQwenClient,
   TranslationQwenRequest,
   TranslationStateStore,
@@ -80,7 +82,10 @@ export {
 } from "./test-doubles.js";
 export {
   createArticleTranslationWorkHandler,
-  type ArticleTranslationWorkHandlerOptions
+  publishTranslationBacklogRecoveryTask,
+  type ArticleTranslationWorkHandlerOptions,
+  type TranslationBacklogRecoveryResult,
+  type TranslationTaskInput
 } from "./translation.js";
 
 export interface TranslationApplication {

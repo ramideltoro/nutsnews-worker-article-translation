@@ -72,6 +72,7 @@ export interface TranslationLanguagePolicy {
 export interface TranslationQualityValidator {
   readonly name: string;
   probe(): TranslationDependencyProbe | Promise<TranslationDependencyProbe>;
+  validate(request: TranslationQualityValidationRequest): TranslationQualityValidationResult | Promise<TranslationQualityValidationResult>;
 }
 
 export interface TranslationWorkTools {
@@ -148,6 +149,36 @@ export interface TranslationStoredLanguageResult extends TranslationLanguageResu
   readonly translatedAt: string;
   readonly persistencePublication?: TranslationPersistencePublication;
 }
+
+export interface TranslationQualityValidationRequest {
+  readonly sourceLanguage: string;
+  readonly targetLanguage: string;
+  readonly summary: string;
+  readonly qualityScore: number;
+  readonly minQualityScore: number;
+  readonly minSummaryChars: number;
+  readonly maxSummaryChars: number;
+}
+
+export type TranslationQualityValidationResult = {
+  readonly ok: true;
+  readonly normalizedSummary: string;
+  readonly auditCodes: readonly string[];
+} | {
+  readonly ok: false;
+  readonly reason:
+    | "empty_summary"
+    | "summary_too_short"
+    | "summary_too_long"
+    | "encoding_error"
+    | "source_copy_leakage"
+    | "target_language_script_mismatch"
+    | "prohibited_boilerplate"
+    | "summary_policy_violation"
+    | "translation_quality_below_threshold";
+  readonly retryable: boolean;
+  readonly auditCodes: readonly string[];
+};
 
 export interface TranslationQwenRequest {
   readonly model: string;
