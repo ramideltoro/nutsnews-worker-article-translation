@@ -23,6 +23,7 @@ describe("loadTranslationConfig", () => {
       prefetch: 4,
       qwen: {
         model: "qwen2.5:3b",
+        promptId: "summary-translation-v1",
         totalTimeoutMs: 30_000,
         maxInputBytes: 32_768
       },
@@ -89,12 +90,14 @@ describe("loadTranslationConfig", () => {
 
   it("parses language policy and quality overrides", () => {
     const config = loadTranslationConfig({
+      NUTSNEWS_TRANSLATION_PROMPT_ID: "summary-translation-v2",
       NUTSNEWS_TRANSLATION_LANGUAGE_POLICY_ID: "required-summaries-v2",
       NUTSNEWS_TRANSLATION_TARGET_LANGUAGES: "fr, ja, fr, de",
       NUTSNEWS_TRANSLATION_PER_LANGUAGE_CONCURRENCY: "2",
       NUTSNEWS_TRANSLATION_QUALITY_MIN_SCORE: "85"
     });
 
+    expect(config.qwen.promptId).toBe("summary-translation-v2");
     expect(config.languagePolicy).toEqual({
       policyId: "required-summaries-v2",
       targetLanguages: [

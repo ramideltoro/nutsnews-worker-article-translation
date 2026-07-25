@@ -123,6 +123,7 @@ export function createTranslationService(options: TranslationServiceOptions): Tr
           dependencyReadinessCheck("database-transactions", options.dependencies.transactionRunner),
           dependencyReadinessCheck("broker-outbox", options.dependencies.brokerOutbox),
           dependencyReadinessCheck("qwen-client", options.dependencies.qwenClient),
+          dependencyReadinessCheck("prompt-registry", options.dependencies.promptRegistry),
           dependencyReadinessCheck("language-policy", options.dependencies.languagePolicy),
           dependencyReadinessCheck("quality-validator", options.dependencies.qualityValidator),
           shadowModeCheck(options.config)

@@ -11,6 +11,7 @@ import {
 import {
   LocalTranslationBrokerOutbox,
   LocalTranslationLanguagePolicy,
+  LocalTranslationPromptRegistry,
   LocalTranslationQualityValidator,
   LocalTranslationQwenClient,
   LocalTranslationTransactionRunner,
@@ -80,14 +81,49 @@ describe("translation test doubles", () => {
     expect(outbox.records).toHaveLength(1);
   });
 
-  it("provides injectable Qwen, language-policy, and quality readiness doubles", async () => {
+  it("provides injectable Qwen, prompt, language-policy, and quality readiness doubles", async () => {
     const qwenClient = new LocalTranslationQwenClient();
+    const promptRegistry = new LocalTranslationPromptRegistry();
     const languagePolicy = new LocalTranslationLanguagePolicy();
     const qualityValidator = new LocalTranslationQualityValidator();
 
     expect(qwenClient.probe()).toEqual({
       status: "ok",
       summary: "local Qwen endpoint ready"
+    });
+    await expect(qwenClient.translate({
+      model: "qwen2.5:3b",
+      prompt: {
+        id: "summary-translation-v1",
+        version: "0.1.0",
+        purpose: "summary-translation",
+        instructions: "Translate."
+      },
+      timeoutMs: 30_000,
+      maxInputBytes: 32_768,
+      deterministic: {
+        temperature: 0,
+        topP: 1
+      },
+      responseSchema: {
+        name: "translation_result_v1",
+        requiredFields: [
+          "summary",
+          "qualityScore"
+        ]
+      },
+      input: {
+        articleId: "article-001",
+        articleVersion: 1,
+        sourceLanguage: "en",
+        targetLanguage: "fr"
+      }
+    })).resolves.toMatchObject({
+      qualityScore: 93
+    });
+    await expect(promptRegistry.getPrompt("summary-translation-v1")).resolves.toMatchObject({
+      id: "summary-translation-v1",
+      version: "0.1.0"
     });
     await expect(languagePolicy.getPolicy()).resolves.toEqual({
       policyId: "required-summaries-v1",

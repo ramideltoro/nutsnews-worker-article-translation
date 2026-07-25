@@ -24,6 +24,7 @@ export const TRANSLATION_CONFIG_SCHEMA = [
   variable("NUTSNEWS_TRANSLATION_QWEN_BASE_URL", "Private Qwen-compatible translation endpoint.", true, true),
   variable("NUTSNEWS_TRANSLATION_QWEN_API_KEY", "Credential for the Qwen-compatible translation endpoint.", true, true),
   variable("NUTSNEWS_TRANSLATION_QWEN_MODEL", "Model identifier used by the injected translation client.", false, false, "qwen2.5:3b"),
+  variable("NUTSNEWS_TRANSLATION_PROMPT_ID", "Versioned summary translation prompt identifier.", false, false, "summary-translation-v1"),
   variable("NUTSNEWS_TRANSLATION_LANGUAGE_POLICY_ID", "Versioned language policy identifier.", false, false, "required-summaries-v1"),
   variable("NUTSNEWS_TRANSLATION_TARGET_LANGUAGES", "Comma-separated required summary language codes.", false, false, "fr,ja,de-CH,de,el"),
   variable("NUTSNEWS_TRANSLATION_PER_LANGUAGE_CONCURRENCY", "Maximum concurrent translation calls for one target language.", false, false, "1"),
@@ -56,6 +57,7 @@ export interface TranslationConfig {
   };
   readonly qwen: {
     readonly model: string;
+    readonly promptId: string;
     readonly totalTimeoutMs: number;
     readonly maxInputBytes: number;
   };
@@ -117,6 +119,7 @@ export function loadTranslationConfig(env: NodeJS.ProcessEnv = process.env): Tra
     dependencies,
     qwen: {
       model: nonEmpty(env.NUTSNEWS_TRANSLATION_QWEN_MODEL, "qwen2.5:3b"),
+      promptId: nonEmpty(env.NUTSNEWS_TRANSLATION_PROMPT_ID, "summary-translation-v1"),
       totalTimeoutMs: parseInteger(env.NUTSNEWS_TRANSLATION_QWEN_TOTAL_TIMEOUT_MS, "NUTSNEWS_TRANSLATION_QWEN_TOTAL_TIMEOUT_MS", 30_000, 1_000, 180_000, issues),
       maxInputBytes: parseInteger(env.NUTSNEWS_TRANSLATION_QWEN_MAX_INPUT_BYTES, "NUTSNEWS_TRANSLATION_QWEN_MAX_INPUT_BYTES", 32_768, 1_024, 1_048_576, issues)
     },

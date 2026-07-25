@@ -35,9 +35,15 @@ import type {
   TranslationDependencyProbe,
   TranslationLanguagePolicy,
   TranslationLanguagePolicySnapshot,
+  TranslationLanguageResultKey,
+  TranslationPersistencePublication,
+  TranslationPrompt,
+  TranslationPromptRegistry,
   TranslationQualityValidator,
   TranslationQwenClient,
+  TranslationQwenRequest,
   TranslationStateStore,
+  TranslationStoredLanguageResult,
   TranslationWorkHandler,
   TranslationWorkTools
 } from "./dependencies.js";
@@ -61,6 +67,7 @@ export class ManualTranslationClock implements RuntimeClock {
 export class InMemoryTranslationStateStore implements TranslationStateStore {
   readonly name: string = "local-translation-state";
   status: TranslationDependencyProbe["status"] = "ok";
+  readonly languageResults: TranslationStoredLanguageResult[] = [];
   private readonly store;
 
   constructor(clock: RuntimeClock = new ManualTranslationClock()) {
@@ -84,6 +91,47 @@ export class InMemoryTranslationStateStore implements TranslationStateStore {
 
   markFailed(idempotencyKey: string, failure: RuntimeIdempotencyFailure): Promise<void> {
     return this.store.markFailed(idempotencyKey, failure);
+  }
+
+  findLanguageResult(key: TranslationLanguageResultKey, transaction: TranslationDatabaseTransaction): Promise<TranslationStoredLanguageResult | undefined> {
+    void transaction;
+    return Promise.resolve(this.languageResults.find((result) => languageResultMatches(result, key)));
+  }
+
+  recordLanguageResult(result: TranslationStoredLanguageResult, transaction: TranslationDatabaseTransaction): Promise<TranslationStoredLanguageResult> {
+    void transaction;
+    const existingIndex = this.languageResults.findIndex((stored) => stored.resultId === result.resultId);
+
+    if (existingIndex >= 0) {
+      this.languageResults[existingIndex] = result;
+    } else {
+      this.languageResults.push(result);
+    }
+
+    return Promise.resolve(result);
+  }
+
+  markPersistencePublished(
+    resultId: string,
+    publication: TranslationPersistencePublication,
+    transaction: TranslationDatabaseTransaction
+  ): Promise<TranslationStoredLanguageResult> {
+    void transaction;
+    const existingIndex = this.languageResults.findIndex((result) => result.resultId === resultId);
+    const existing = this.languageResults[existingIndex];
+
+    if (existingIndex < 0 || existing === undefined) {
+      return Promise.reject(new Error(`No local translation result recorded for ${resultId}.`));
+    }
+
+    const updated = {
+      ...existing,
+      persistencePublication: publication
+    };
+
+    this.languageResults[existingIndex] = updated;
+
+    return Promise.resolve(updated);
   }
 }
 
@@ -134,12 +182,75 @@ export class LocalTranslationBrokerOutbox implements TranslationBrokerOutbox {
 export class LocalTranslationQwenClient implements TranslationQwenClient {
   readonly name: string = "local-qwen-client";
   status: TranslationDependencyProbe["status"] = "ok";
+  readonly requests: TranslationQwenRequest[] = [];
+  readonly responsesByLanguage = new Map<string, unknown>();
+  readonly errorsByLanguage = new Map<string, unknown>();
+  response: unknown = {
+    summary: "Translated public-interest summary with enough detail for publication.",
+    qualityScore: 93,
+    latencyMs: 41,
+    usage: {
+      inputTokens: 120,
+      outputTokens: 38,
+      totalTokens: 158
+    }
+  };
+  error: unknown;
 
   probe(): TranslationDependencyProbe {
     return {
       status: this.status,
       summary: this.status === "ok" ? "local Qwen endpoint ready" : "local Qwen endpoint degraded"
     };
+  }
+
+  translate(request: TranslationQwenRequest): Promise<unknown> {
+    this.requests.push(request);
+
+    const languageError = this.errorsByLanguage.get(request.input.targetLanguage);
+
+    if (languageError !== undefined) {
+      return Promise.reject(toError(languageError));
+    }
+
+    if (this.error !== undefined) {
+      return Promise.reject(toError(this.error));
+    }
+
+    return Promise.resolve(this.responsesByLanguage.get(request.input.targetLanguage) ?? this.response);
+  }
+}
+
+export class LocalTranslationPromptRegistry implements TranslationPromptRegistry {
+  readonly name: string = "local-prompt-registry";
+  status: TranslationDependencyProbe["status"] = "ok";
+  readonly prompts = new Map<string, TranslationPrompt>([
+    [
+      "summary-translation-v1",
+      {
+        id: "summary-translation-v1",
+        version: "0.1.0",
+        purpose: "summary-translation",
+        instructions: "Translate the approved summary into the requested target language and return a compact publication-ready summary."
+      }
+    ]
+  ]);
+
+  probe(): TranslationDependencyProbe {
+    return {
+      status: this.status,
+      summary: this.status === "ok" ? "local prompt registry ready" : "local prompt registry degraded"
+    };
+  }
+
+  getPrompt(id: string): Promise<TranslationPrompt> {
+    const prompt = this.prompts.get(id);
+
+    if (prompt === undefined) {
+      return Promise.reject(new Error(`Unknown local translation prompt ${id}.`));
+    }
+
+    return Promise.resolve(prompt);
   }
 }
 
@@ -289,10 +400,28 @@ export function createLocalTranslationDependencies(options: {
     brokerOutbox: new LocalTranslationBrokerOutbox(),
     brokerTransport: new LocalBrokerTransport(),
     qwenClient: new LocalTranslationQwenClient(),
+    promptRegistry: new LocalTranslationPromptRegistry(),
     languagePolicy: new LocalTranslationLanguagePolicy(),
     qualityValidator: new LocalTranslationQualityValidator(),
     workHandler: options.workHandler ?? new LocalTranslationWorkHandler()
   };
+}
+
+function languageResultMatches(
+  result: TranslationStoredLanguageResult,
+  key: TranslationLanguageResultKey
+): boolean {
+  return result.articleId === key.articleId
+    && result.articleVersion === key.articleVersion
+    && result.sourceLanguage === key.sourceLanguage
+    && result.targetLanguage === key.targetLanguage
+    && result.promptId === key.promptId
+    && result.promptVersion === key.promptVersion
+    && result.model === key.model;
+}
+
+function toError(value: unknown): Error {
+  return value instanceof Error ? value : new Error(String(value));
 }
 
 export function createMinimalTranslationEnvelope(overrides: Partial<WorkerMessageEnvelope> = {}): WorkerMessageEnvelope {
