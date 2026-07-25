@@ -18,6 +18,7 @@ import {
   InMemoryTranslationStateStore,
   LocalTranslationBrokerOutbox,
   LocalTranslationLanguagePolicy,
+  LocalTranslationPromptRegistry,
   LocalTranslationQualityValidator,
   LocalTranslationQwenClient,
   LocalTranslationTransactionRunner,
@@ -142,9 +143,10 @@ describe("createTranslationService", () => {
     await context.service.stop();
   });
 
-  it("observes language policy and quality validator readiness", async () => {
+  it("observes prompt registry, language policy, and quality validator readiness", async () => {
     const context = createServiceContext();
 
+    context.promptRegistry.status = "degraded";
     context.languagePolicy.status = "degraded";
     context.qualityValidator.status = "unhealthy";
     await context.service.start();
@@ -183,6 +185,7 @@ function createServiceContext() {
     metrics,
     outbox: dependencies.brokerOutbox as LocalTranslationBrokerOutbox,
     languagePolicy: dependencies.languagePolicy as LocalTranslationLanguagePolicy,
+    promptRegistry: dependencies.promptRegistry as LocalTranslationPromptRegistry,
     qualityValidator: dependencies.qualityValidator as LocalTranslationQualityValidator,
     qwenClient: dependencies.qwenClient as LocalTranslationQwenClient,
     service,

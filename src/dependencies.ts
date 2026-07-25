@@ -16,6 +16,9 @@ export interface TranslationDependencyProbe {
 export interface TranslationStateStore extends RuntimeIdempotencyStore {
   readonly name: string;
   probe(): TranslationDependencyProbe | Promise<TranslationDependencyProbe>;
+  findLanguageResult(key: TranslationLanguageResultKey, transaction: TranslationDatabaseTransaction): Promise<TranslationStoredLanguageResult | undefined>;
+  recordLanguageResult(result: TranslationStoredLanguageResult, transaction: TranslationDatabaseTransaction): Promise<TranslationStoredLanguageResult>;
+  markPersistencePublished(resultId: string, publication: TranslationPersistencePublication, transaction: TranslationDatabaseTransaction): Promise<TranslationStoredLanguageResult>;
 }
 
 export interface TranslationDatabaseTransaction {
@@ -37,6 +40,20 @@ export interface TranslationBrokerOutbox {
 export interface TranslationQwenClient {
   readonly name: string;
   probe(): TranslationDependencyProbe | Promise<TranslationDependencyProbe>;
+  translate(request: TranslationQwenRequest): Promise<unknown>;
+}
+
+export interface TranslationPrompt {
+  readonly id: string;
+  readonly version: string;
+  readonly purpose: "summary-translation";
+  readonly instructions: string;
+}
+
+export interface TranslationPromptRegistry {
+  readonly name: string;
+  probe(): TranslationDependencyProbe | Promise<TranslationDependencyProbe>;
+  getPrompt(id: string): Promise<TranslationPrompt>;
 }
 
 export interface TranslationLanguagePolicySnapshot {
@@ -75,7 +92,100 @@ export interface TranslationDependencies {
   readonly brokerOutbox: TranslationBrokerOutbox;
   readonly brokerTransport: RuntimeBrokerTransport;
   readonly qwenClient: TranslationQwenClient;
+  readonly promptRegistry: TranslationPromptRegistry;
   readonly languagePolicy: TranslationLanguagePolicy;
   readonly qualityValidator: TranslationQualityValidator;
   readonly workHandler: TranslationWorkHandler;
+}
+
+export interface TranslationLanguageResultKey {
+  readonly articleId: string;
+  readonly articleVersion: number;
+  readonly sourceLanguage: string;
+  readonly targetLanguage: string;
+  readonly promptId: string;
+  readonly promptVersion: string;
+  readonly model: string;
+}
+
+export interface TranslationPersistencePublication {
+  readonly messageId: string;
+  readonly idempotencyKey: string;
+  readonly publishedAt: string;
+}
+
+export interface TranslationStoredLanguageResult extends TranslationLanguageResultKey {
+  readonly resultId: string;
+  readonly status: "success" | "permanent_failure";
+  readonly failureReason?: string;
+  readonly summaryRef?: {
+    readonly kind: "backend-record";
+    readonly uri: string;
+    readonly mediaType: "application/json";
+    readonly articleId: string;
+    readonly targetLanguage: string;
+    readonly resultId: string;
+  };
+  readonly qualityRef?: {
+    readonly kind: "backend-record";
+    readonly uri: string;
+    readonly mediaType: "application/json";
+    readonly qualityScore: number;
+    readonly resultId: string;
+  };
+  readonly aiUsageRef?: {
+    readonly kind: "backend-record";
+    readonly uri: string;
+    readonly mediaType: "application/json";
+    readonly inputTokens: number;
+    readonly outputTokens: number;
+    readonly totalTokens: number;
+  };
+  readonly sourceMessageId: string;
+  readonly correlationId: string;
+  readonly traceparent: string;
+  readonly latencyMs: number;
+  readonly translatedAt: string;
+  readonly persistencePublication?: TranslationPersistencePublication;
+}
+
+export interface TranslationQwenRequest {
+  readonly model: string;
+  readonly prompt: TranslationPrompt;
+  readonly timeoutMs: number;
+  readonly maxInputBytes: number;
+  readonly deterministic: {
+    readonly temperature: 0;
+    readonly topP: 1;
+  };
+  readonly responseSchema: {
+    readonly name: "translation_result_v1";
+    readonly requiredFields: readonly string[];
+  };
+  readonly input: {
+    readonly articleId: string;
+    readonly articleVersion: number;
+    readonly sourceLanguage: string;
+    readonly targetLanguage: string;
+  };
+}
+
+export class TranslationQwenError extends Error {
+  readonly reason: "qwen-timeout" | "qwen-rate-limited" | "qwen-unauthorized" | "qwen-model-error";
+  readonly retryable: boolean;
+  readonly retryAfterMs: number | undefined;
+
+  constructor(
+    reason: TranslationQwenError["reason"],
+    options: {
+      readonly retryable: boolean;
+      readonly retryAfterMs?: number;
+    }
+  ) {
+    super(reason);
+    this.name = "TranslationQwenError";
+    this.reason = reason;
+    this.retryable = options.retryable;
+    this.retryAfterMs = options.retryAfterMs;
+  }
 }

@@ -3,7 +3,6 @@ import { pathToFileURL } from "node:url";
 import { getContractPackageMetadata } from "@ramideltoro/nutsnews-worker-contracts";
 import {
   createJsonRuntimeTelemetrySink,
-  createPrometheusRuntimeTelemetrySink,
   createRuntimeShutdownController,
   getRuntimePackageMetadata,
   SYSTEM_RUNTIME_CLOCK,
@@ -15,8 +14,10 @@ import {
   type TranslationConfig
 } from "./config.js";
 import { createTranslationHttpServer } from "./http.js";
+import { createTranslationPrometheusMetricsSink } from "./metrics.js";
 import { createTranslationService } from "./service.js";
 import { createLocalTranslationDependencies } from "./test-doubles.js";
+import { createArticleTranslationWorkHandler } from "./translation.js";
 
 export {
   TRANSLATION_CONFIG_SCHEMA,
@@ -34,16 +35,29 @@ export type {
   TranslationDependencyProbe,
   TranslationLanguagePolicy,
   TranslationLanguagePolicySnapshot,
+  TranslationLanguageResultKey,
+  TranslationPersistencePublication,
+  TranslationPrompt,
+  TranslationPromptRegistry,
   TranslationQualityValidator,
   TranslationQwenClient,
+  TranslationQwenRequest,
   TranslationStateStore,
+  TranslationStoredLanguageResult,
   TranslationWorkHandler,
   TranslationWorkTools
+} from "./dependencies.js";
+export {
+  TranslationQwenError
 } from "./dependencies.js";
 export {
   createTranslationHttpServer,
   type TranslationHttpServer
 } from "./http.js";
+export {
+  createTranslationPrometheusMetricsSink,
+  type TranslationPrometheusMetricsSink
+} from "./metrics.js";
 export {
   createTranslationService,
   type TranslationService
@@ -52,6 +66,7 @@ export {
   InMemoryTranslationStateStore,
   LocalTranslationBrokerOutbox,
   LocalTranslationLanguagePolicy,
+  LocalTranslationPromptRegistry,
   LocalTranslationQualityValidator,
   LocalTranslationQwenClient,
   LocalTranslationTransactionRunner,
@@ -63,6 +78,10 @@ export {
   createMinimalTranslationEnvelope,
   createMinimalTranslationPayload
 } from "./test-doubles.js";
+export {
+  createArticleTranslationWorkHandler,
+  type ArticleTranslationWorkHandlerOptions
+} from "./translation.js";
 
 export interface TranslationApplication {
   readonly config: TranslationConfig;
@@ -86,14 +105,24 @@ export function createTranslationApplication(config = loadTranslationConfig()): 
       })
     : undefined;
   const metrics = config.metricsEnabled
-    ? createPrometheusRuntimeTelemetrySink({
+    ? createTranslationPrometheusMetricsSink({
         identity
       })
     : undefined;
   const telemetry = combineTelemetrySinks(logSink, metrics);
-  const dependencies = createLocalTranslationDependencies({
+  const baseDependencies = createLocalTranslationDependencies({
     clock: SYSTEM_RUNTIME_CLOCK
   });
+  const dependencies = {
+    ...baseDependencies,
+    workHandler: createArticleTranslationWorkHandler({
+      config,
+      dependencies: baseDependencies,
+      ...(telemetry === undefined ? {} : {
+        telemetry
+      })
+    })
+  };
   const service = createTranslationService({
     config,
     dependencies,
