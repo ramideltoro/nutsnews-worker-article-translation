@@ -86,6 +86,11 @@ interface PayloadCarrier {
   readonly payload: Readonly<Record<string, unknown>>;
 }
 
+interface PayloadConsumerRegistration {
+  readonly handler: BrokerDeliveryHandler;
+  consumerTag: string | undefined;
+}
+
 interface PgTranslationTransaction extends TranslationDatabaseTransaction {
   readonly client: PoolClient;
 }
@@ -97,6 +102,7 @@ interface LocalAiUsage {
 }
 
 type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
+type RabbitMqConnect = (url: string) => Promise<ChannelModel>;
 
 export function createProductionTranslationDependencies(
   options: ProductionTranslationDependencyOptions
@@ -145,7 +151,8 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
   private readonly url: string;
   private readonly prefetchCount: number;
   private readonly clock: RuntimeClock;
-  private readonly consumers = new Map<WorkerStage, { readonly consumerTag: string; readonly handler: BrokerDeliveryHandler }>();
+  private readonly connectToBroker: RabbitMqConnect;
+  private readonly consumers = new Map<WorkerStage, PayloadConsumerRegistration>();
   private readonly inFlight = new Set<Promise<void>>();
   private connection: ChannelModel | undefined;
   private channel: ConfirmChannel | undefined;
@@ -156,10 +163,12 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
     readonly url: string;
     readonly prefetch: number;
     readonly clock: RuntimeClock;
+    readonly connect?: RabbitMqConnect;
   }) {
     this.url = options.url;
     this.prefetchCount = options.prefetch;
     this.clock = options.clock;
+    this.connectToBroker = options.connect ?? amqpConnect;
   }
 
   get inFlightDeliveryCount(): number {
@@ -201,34 +210,29 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
   }
 
   async consume(stage: WorkerStage, handler: BrokerDeliveryHandler): Promise<BrokerConsumerHandle> {
-    const route = getWorkerRoute(stage);
     const channel = await this.ensureChannel();
-    await channel.prefetch(this.prefetchCount);
-    const reply = await channel.consume(route.mainQueue.name, (message) => {
-      if (message === null) {
-        this.consumers.delete(stage);
-        return;
-      }
+    const existing = this.consumers.get(stage);
 
-      const tracked = this.handleDelivery(stage, handler, message);
-      this.inFlight.add(tracked);
-      void tracked.finally(() => {
-        this.inFlight.delete(tracked);
-      });
-    }, {
-      noAck: false
-    });
+    if (existing?.consumerTag !== undefined) {
+      await channel.cancel(existing.consumerTag).catch(() => undefined);
+    }
 
-    this.consumers.set(stage, {
-      consumerTag: reply.consumerTag,
-      handler
-    });
+    const registration: PayloadConsumerRegistration = {
+      handler,
+      consumerTag: undefined
+    };
+    this.consumers.set(stage, registration);
+    await this.activateConsumer(stage, registration, channel);
 
     return {
       stage,
       cancel: async (): Promise<void> => {
+        const registered = this.consumers.get(stage);
         this.consumers.delete(stage);
-        await channel.cancel(reply.consumerTag);
+
+        if (registered?.consumerTag !== undefined && this.channel !== undefined) {
+          await this.channel.cancel(registered.consumerTag).catch(() => undefined);
+        }
       }
     };
   }
@@ -254,7 +258,9 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
 
     if (channel !== undefined) {
       for (const registration of this.consumers.values()) {
-        await channel.cancel(registration.consumerTag);
+        if (registration.consumerTag !== undefined) {
+          await channel.cancel(registration.consumerTag).catch(() => undefined);
+        }
       }
     }
 
@@ -281,20 +287,70 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
       throw new Error("RabbitMQ payload transport is closing.");
     }
 
-    const connection = await amqpConnect(this.url);
+    const connection = await this.connectToBroker(this.url);
     const channel = await connection.createConfirmChannel();
     this.connection = connection;
     this.channel = channel;
 
     connection.on("close", () => {
-      this.connection = undefined;
-      this.channel = undefined;
+      if (this.connection === connection) {
+        this.connection = undefined;
+      }
+
+      this.markChannelClosed(channel);
     });
     channel.on("close", () => {
-      this.channel = undefined;
+      this.markChannelClosed(channel);
     });
 
+    await this.restoreConsumers(channel);
+
     return channel;
+  }
+
+  private async restoreConsumers(channel: ConfirmChannel): Promise<void> {
+    for (const [stage, registration] of this.consumers) {
+      await this.activateConsumer(stage, registration, channel);
+    }
+  }
+
+  private async activateConsumer(
+    stage: WorkerStage,
+    registration: PayloadConsumerRegistration,
+    channel: ConfirmChannel
+  ): Promise<void> {
+    if (registration.consumerTag !== undefined) {
+      return;
+    }
+
+    const route = getWorkerRoute(stage);
+    await channel.prefetch(this.prefetchCount);
+    const reply = await channel.consume(route.mainQueue.name, (message) => {
+      if (message === null) {
+        registration.consumerTag = undefined;
+        return;
+      }
+
+      const tracked = this.handleDelivery(stage, registration.handler, message);
+      this.inFlight.add(tracked);
+      void tracked.finally(() => {
+        this.inFlight.delete(tracked);
+      });
+    }, {
+      noAck: false
+    });
+
+    registration.consumerTag = reply.consumerTag;
+  }
+
+  private markChannelClosed(channel: ConfirmChannel): void {
+    if (this.channel === channel) {
+      this.channel = undefined;
+    }
+
+    for (const registration of this.consumers.values()) {
+      registration.consumerTag = undefined;
+    }
   }
 
   private async handleDelivery(
