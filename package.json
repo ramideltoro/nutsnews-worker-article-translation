@@ -40,7 +40,9 @@
   },
   "dependencies": {
     "@ramideltoro/nutsnews-worker-contracts": "0.4.0",
-    "@ramideltoro/nutsnews-worker-runtime": "0.4.0"
+    "@ramideltoro/nutsnews-worker-runtime": "0.4.0",
+    "amqplib": "^2.0.1",
+    "pg": "^8.22.0"
   },
   "overrides": {
     "@ramideltoro/nutsnews-worker-runtime": {
@@ -49,7 +51,9 @@
   },
   "devDependencies": {
     "@eslint/js": "^9.32.0",
+    "@types/amqplib": "^0.10.8",
     "@types/node": "^24.1.0",
+    "@types/pg": "^8.20.0",
     "eslint": "^9.32.0",
     "typescript": "^5.8.3",
     "typescript-eslint": "^8.38.0",
