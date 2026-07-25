@@ -38,6 +38,22 @@ describe("LocalTranslationQualityValidator", () => {
     expect(invalidReason(validator, "Le rapport decrit une avancee utile avec assez de details.", "ja")).toBe("target_language_script_mismatch");
     expect(invalidReason(validator, "Le rapport decrit une avancee utile avec assez de details.", "fr", 50)).toBe("translation_quality_below_threshold");
   });
+
+  it("does not classify French article cognates as source copy leakage", () => {
+    const validator = new LocalTranslationQualityValidator();
+
+    expect(validator.validate({
+      sourceLanguage: "en",
+      targetLanguage: "fr",
+      summary: "L'article presente une avancee utile pour le public avec des details suffisants.",
+      qualityScore: 88,
+      minQualityScore: 80,
+      minSummaryChars: 24,
+      maxSummaryChars: 420
+    })).toMatchObject({
+      ok: true
+    });
+  });
 });
 
 const validFixtures = [
