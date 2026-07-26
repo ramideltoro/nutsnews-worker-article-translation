@@ -158,6 +158,8 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
   private channel: ConfirmChannel | undefined;
   private routes: readonly WorkerRoute[] = [];
   private closing = false;
+  private reconnecting: Promise<void> | undefined;
+  private reconnectRetry: ReturnType<typeof setTimeout> | undefined;
 
   constructor(options: {
     readonly url: string;
@@ -254,6 +256,7 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
 
   async close(): Promise<void> {
     this.closing = true;
+    this.clearReconnectRetry();
     const channel = this.channel;
 
     if (channel !== undefined) {
@@ -291,6 +294,7 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
     const channel = await connection.createConfirmChannel();
     this.connection = connection;
     this.channel = channel;
+    this.clearReconnectRetry();
 
     connection.on("close", () => {
       if (this.connection === connection) {
@@ -328,6 +332,7 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
     const reply = await channel.consume(route.mainQueue.name, (message) => {
       if (message === null) {
         registration.consumerTag = undefined;
+        this.recoverCancelledConsumer(stage, registration, channel);
         return;
       }
 
@@ -344,13 +349,67 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
   }
 
   private markChannelClosed(channel: ConfirmChannel): void {
-    if (this.channel === channel) {
-      this.channel = undefined;
+    if (this.channel !== channel) {
+      return;
     }
+
+    this.channel = undefined;
 
     for (const registration of this.consumers.values()) {
       registration.consumerTag = undefined;
     }
+
+    this.recoverConsumersAfterDisconnect();
+  }
+
+  private recoverCancelledConsumer(
+    stage: WorkerStage,
+    registration: PayloadConsumerRegistration,
+    channel: ConfirmChannel
+  ): void {
+    if (this.closing || this.channel !== channel || this.consumers.get(stage) !== registration) {
+      return;
+    }
+
+    void this.activateConsumer(stage, registration, channel).catch(() => {
+      this.markChannelClosed(channel);
+    });
+  }
+
+  private recoverConsumersAfterDisconnect(): void {
+    if (this.closing || this.consumers.size === 0 || this.reconnecting !== undefined) {
+      return;
+    }
+
+    this.reconnecting = this.ensureChannel()
+      .then(() => undefined)
+      .catch(() => {
+        this.scheduleReconnectRetry();
+      })
+      .finally(() => {
+        this.reconnecting = undefined;
+      });
+  }
+
+  private scheduleReconnectRetry(): void {
+    if (this.closing || this.consumers.size === 0 || this.reconnectRetry !== undefined) {
+      return;
+    }
+
+    this.reconnectRetry = setTimeout(() => {
+      this.reconnectRetry = undefined;
+      this.recoverConsumersAfterDisconnect();
+    }, 1_000);
+    this.reconnectRetry.unref();
+  }
+
+  private clearReconnectRetry(): void {
+    if (this.reconnectRetry === undefined) {
+      return;
+    }
+
+    clearTimeout(this.reconnectRetry);
+    this.reconnectRetry = undefined;
   }
 
   private async handleDelivery(
