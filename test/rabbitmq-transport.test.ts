@@ -28,6 +28,7 @@ interface FakeChannel {
   readonly cancelTags: string[];
   readonly consumeQueues: string[];
   readonly prefetchCalls: number[];
+  emitConsumerCancel(index?: number): void;
   emitClose(): void;
   toConfirmChannel(): ConfirmChannel;
 }
@@ -60,13 +61,41 @@ describe("RabbitMQ payload transport", () => {
     ]);
 
     broker.connections[0]?.emitClose();
-    await transport.connect();
+    await waitForCondition(() => broker.connections[1]?.channel.consumeQueues.length === 1);
 
     expect(broker.connections).toHaveLength(2);
     expect(broker.connections[1]?.channel.consumeQueues).toEqual([
       "nutsnews.worker.translation.v1"
     ]);
     expect(broker.connections[1]?.channel.prefetchCalls).toEqual([
+      2
+    ]);
+  });
+
+  it("reinstalls consumers cancelled by RabbitMQ without reconnecting", async () => {
+    const broker = createFakeBroker();
+    const transport = new PayloadRabbitMqTransport({
+      url: "amqp://translation:test@example.invalid:5672",
+      prefetch: 2,
+      clock,
+      connect: broker.connect
+    });
+
+    await transport.consume("translation", () => Promise.resolve({
+      action: "dlq",
+      reason: "not-used"
+    }));
+
+    broker.connections[0]?.channel.emitConsumerCancel();
+    await waitForCondition(() => broker.connections[0]?.channel.consumeQueues.length === 2);
+
+    expect(broker.connections).toHaveLength(1);
+    expect(broker.connections[0]?.channel.consumeQueues).toEqual([
+      "nutsnews.worker.translation.v1",
+      "nutsnews.worker.translation.v1"
+    ]);
+    expect(broker.connections[0]?.channel.prefetchCalls).toEqual([
+      2,
       2
     ]);
   });
@@ -125,6 +154,7 @@ function createFakeConnection(): FakeConnection {
 function createFakeChannel(): FakeChannel {
   const cancelTags: string[] = [];
   const consumeQueues: string[] = [];
+  const consumers: ((message: ConsumeMessage | null) => void)[] = [];
   const prefetchCalls: number[] = [];
   const closeHandlers: CloseHandler[] = [];
   const channel = {
@@ -133,8 +163,8 @@ function createFakeChannel(): FakeChannel {
       return Promise.resolve();
     },
     consume(queue: string, onMessage: (message: ConsumeMessage | null) => void): Promise<{ readonly consumerTag: string }> {
-      void onMessage;
       consumeQueues.push(queue);
+      consumers.push(onMessage);
       return Promise.resolve({
         consumerTag: `consumer-${String(consumeQueues.length)}`
       });
@@ -163,6 +193,9 @@ function createFakeChannel(): FakeChannel {
     cancelTags,
     consumeQueues,
     prefetchCalls,
+    emitConsumerCancel(index = consumers.length - 1): void {
+      consumers[index]?.(null);
+    },
     emitClose(): void {
       for (const handler of closeHandlers) {
         handler();
@@ -176,4 +209,18 @@ function createFakeChannel(): FakeChannel {
 
 function isCloseHandler(handler: unknown): handler is CloseHandler {
   return typeof handler === "function";
+}
+
+async function waitForCondition(condition: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    if (condition()) {
+      return;
+    }
+
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
+  }
+
+  throw new Error("Timed out waiting for condition.");
 }
