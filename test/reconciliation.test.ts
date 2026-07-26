@@ -237,7 +237,11 @@ describe("translation outbox reconciliation", () => {
 
   it("recovers a legacy translation-status row when the status source differs from language result sources", async () => {
     const result = storedResultSnapshot();
-    const command = legacyTranslationStatusCommand(result, "018f1598-2dd5-7c4f-9f92-8f7a7f8b3511");
+    const command = legacyTranslationStatusCommand(
+      result,
+      "018f1598-2dd5-7c4f-9f92-8f7a7f8b3511",
+      jsonbOrderedSummaryRef(result.summaryRef)
+    );
     const pool = new FakePool([
       {
         ...outboxRow(command),
@@ -544,7 +548,11 @@ function legacyPersistenceCommand(result: TranslationStoredLanguageResult): Brok
   };
 }
 
-function legacyTranslationStatusCommand(result: TranslationStoredLanguageResult, sourceMessageId: string): BrokerPublishCommand {
+function legacyTranslationStatusCommand(
+  result: TranslationStoredLanguageResult,
+  sourceMessageId: string,
+  summaryRef: NonNullable<TranslationStoredLanguageResult["summaryRef"]>
+): BrokerPublishCommand {
   const route = getWorkerRoute("persistence");
   const payload = {
     schemaId: STAGE_PAYLOAD_SCHEMA_IDS.translationResult,
@@ -572,7 +580,7 @@ function legacyTranslationStatusCommand(result: TranslationStoredLanguageResult,
       "el"
     ],
     summaryRefs: [
-      result.summaryRef
+      summaryRef
     ]
   };
   const envelope = assertWorkerEnvelope({
@@ -613,6 +621,23 @@ function legacyTranslationStatusCommand(result: TranslationStoredLanguageResult,
   return {
     envelope,
     payload
+  };
+}
+
+function jsonbOrderedSummaryRef(
+  ref: NonNullable<TranslationStoredLanguageResult["summaryRef"]> | undefined
+): NonNullable<TranslationStoredLanguageResult["summaryRef"]> {
+  if (ref === undefined) {
+    throw new Error("expected summary ref");
+  }
+
+  return {
+    uri: ref.uri,
+    kind: "backend-record",
+    resultId: ref.resultId,
+    articleId: ref.articleId,
+    mediaType: "application/json",
+    targetLanguage: ref.targetLanguage
   };
 }
 
