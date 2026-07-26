@@ -1416,7 +1416,6 @@ export class PostgresTranslationOutboxReconciler implements TranslationReconcile
     if (!sameStringSet(successfulLanguages, completedLanguageCodes)
       || !matchingResults.every((result) => result.articleId === articleId
         && result.articleVersion === row.operation_version
-        && result.sourceMessageId === sourceMessageId
         && result.traceparent === traceparent
         && result.model === this.options.config.qwen.model
         && result.promptId === this.options.config.qwen.promptId)) {

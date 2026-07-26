@@ -234,6 +234,52 @@ describe("translation outbox reconciliation", () => {
     expect(replay?.envelope.causationId).toBe(command.envelope.causationId);
     expect(replay?.envelope.aggregate).toEqual(command.envelope.aggregate);
   });
+
+  it("recovers a legacy translation-status row when the status source differs from language result sources", async () => {
+    const result = storedResultSnapshot();
+    const command = legacyTranslationStatusCommand(result, "018f1598-2dd5-7c4f-9f92-8f7a7f8b3511");
+    const pool = new FakePool([
+      {
+        ...outboxRow(command),
+        diagnostic_metadata: {
+          payload: jsonbLikeStatusPayload(command.payload),
+          payloadSchemaId: command.payload.schemaId,
+          exchange: getWorkerRoute("persistence").exchange
+        }
+      }
+    ], [
+      {
+        result_snapshot: result
+      }
+    ]);
+    const transport = new FakeBrokerTransport();
+    const reconciler = new PostgresTranslationOutboxReconciler({
+      pool: pool.asPool(),
+      brokerTransport: transport,
+      clock,
+      env: {
+        NUTSNEWS_TRANSLATION_RECONCILIATION_APPLY_ENABLED: "true"
+      },
+      config: testConfig
+    });
+
+    const report = await reconciler.reconcile({
+      mode: "apply",
+      runId: "recovery-legacy-translation-status",
+      reason: "empty broker recovery",
+      protectedConfirmation: TRANSLATION_RECONCILIATION_CONFIRMATION
+    });
+
+    expect(report.status).toBe("applied");
+    expect(transport.published).toHaveLength(1);
+    const replay = transport.published[0];
+    expect(replay?.payload).toEqual(command.payload);
+    expect(replay?.envelope.messageId).not.toBe(command.envelope.messageId);
+    expect(replay?.envelope.idempotencyKey).toBe(command.envelope.idempotencyKey);
+    expect(replay?.envelope.correlationId).toBe(command.envelope.correlationId);
+    expect(replay?.envelope.causationId).toBe(command.envelope.causationId);
+    expect(replay?.envelope.aggregate).toEqual(command.envelope.aggregate);
+  });
 });
 
 const testConfig: TranslationConfig = {
@@ -498,6 +544,78 @@ function legacyPersistenceCommand(result: TranslationStoredLanguageResult): Brok
   };
 }
 
+function legacyTranslationStatusCommand(result: TranslationStoredLanguageResult, sourceMessageId: string): BrokerPublishCommand {
+  const route = getWorkerRoute("persistence");
+  const payload = {
+    schemaId: STAGE_PAYLOAD_SCHEMA_IDS.translationResult,
+    schemaVersion: STAGE_PAYLOAD_SCHEMA_VERSION,
+    pipelineRunId: "018f1598-2dd5-7c4f-9f92-8f7a7f8b3501",
+    stageExecutionId: stableUuid([
+      "translation-status",
+      result.articleId,
+      String(result.articleVersion),
+      result.model
+    ]),
+    sourceMessageId,
+    idempotencyKey: `translation:result:${result.articleId}:${String(result.articleVersion)}`,
+    traceparent: result.traceparent,
+    producedAt: now,
+    articleId: result.articleId,
+    translationStatus: "partial",
+    completedLanguageCodes: [
+      result.targetLanguage
+    ],
+    missingLanguageCodes: [
+      "ja",
+      "de-CH",
+      "de",
+      "el"
+    ],
+    summaryRefs: [
+      result.summaryRef
+    ]
+  };
+  const envelope = assertWorkerEnvelope({
+    schemaId: route.schemaId,
+    schemaVersion: 1,
+    route: "persistence",
+    messageId: stableUuid([
+      "persistence-message",
+      payload.idempotencyKey
+    ]),
+    causationId: sourceMessageId,
+    correlationId: result.correlationId,
+    traceparent: result.traceparent,
+    idempotencyKey: payload.idempotencyKey,
+    aggregate: {
+      type: "article",
+      id: result.articleId,
+      version: result.articleVersion
+    },
+    occurredAt: now,
+    attempt: {
+      count: 1,
+      max: WORKER_DELIVERY_BEHAVIOR.maxAttempts,
+      firstAttemptAt: now
+    },
+    producer: {
+      name: "nutsnews-worker-article-translation",
+      version: "0.1.0"
+    },
+    payloadRef: {
+      kind: "backend-record",
+      uri: `backend://worker-uplift/translation/${encodeURIComponent(result.articleId)}/translation-status`,
+      mediaType: "application/json",
+      sizeBytes: getStagePayloadSizeBytes(payload)
+    }
+  });
+
+  return {
+    envelope,
+    payload
+  };
+}
+
 function jsonbLikePersistencePayload(payload: BrokerPublishCommand["payload"]): Readonly<Record<string, unknown>> {
   return {
     schemaId: payload.schemaId,
@@ -514,6 +632,24 @@ function jsonbLikePersistencePayload(payload: BrokerPublishCommand["payload"]): 
     sourceMessageId: payload.sourceMessageId,
     backendOperation: payload.backendOperation,
     stageExecutionId: payload.stageExecutionId
+  };
+}
+
+function jsonbLikeStatusPayload(payload: BrokerPublishCommand["payload"]): Readonly<Record<string, unknown>> {
+  return {
+    schemaId: payload.schemaId,
+    articleId: payload.articleId,
+    producedAt: payload.producedAt,
+    summaryRefs: payload.summaryRefs,
+    traceparent: payload.traceparent,
+    pipelineRunId: payload.pipelineRunId,
+    schemaVersion: payload.schemaVersion,
+    idempotencyKey: payload.idempotencyKey,
+    sourceMessageId: payload.sourceMessageId,
+    stageExecutionId: payload.stageExecutionId,
+    translationStatus: payload.translationStatus,
+    missingLanguageCodes: payload.missingLanguageCodes,
+    completedLanguageCodes: payload.completedLanguageCodes
   };
 }
 
