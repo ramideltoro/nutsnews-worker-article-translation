@@ -2,7 +2,10 @@ import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 
 import {
+  STAGE_PAYLOAD_SCHEMA_IDS,
+  STAGE_PAYLOAD_SCHEMA_VERSION,
   WORKER_DELIVERY_BEHAVIOR,
+  getStagePayloadSizeBytes,
   getWorkerRoute,
   validateStagePayload,
   validateWorkerEnvelope,
@@ -137,7 +140,8 @@ export function createProductionTranslationDependencies(
     pool,
     brokerTransport,
     clock: options.clock,
-    env
+    env,
+    config: options.config
   });
   const reconciliationToken = reconciliationTokenFromEnv(env);
   const qwenClient = new LocalAiTranslationQwenClient({
@@ -849,6 +853,7 @@ interface TranslationOutboxReconcilerOptions {
   readonly brokerTransport: RuntimeBrokerTransport;
   readonly clock: RuntimeClock;
   readonly env: NodeJS.ProcessEnv;
+  readonly config: TranslationConfig;
 }
 
 interface TranslationOutboxRow extends QueryResultRow {
@@ -877,6 +882,21 @@ interface HydratedReplay {
   readonly candidate: TranslationReconciliationCandidate;
   readonly command: BrokerPublishCommand;
 }
+
+interface TranslationResultSnapshotRow extends QueryResultRow {
+  readonly result_snapshot: unknown;
+}
+
+type RecoveryResult = {
+  readonly status: "not_applicable";
+} | {
+  readonly status: "failed";
+  readonly reason: string;
+} | {
+  readonly status: "recovered";
+  readonly payload: Readonly<Record<string, unknown>>;
+  readonly envelope: WorkerMessageEnvelope;
+};
 
 export class PostgresTranslationOutboxReconciler implements TranslationReconciler {
   readonly name = "postgres-translation-outbox-reconciler";
@@ -928,7 +948,7 @@ export class PostgresTranslationOutboxReconciler implements TranslationReconcile
     }
 
     const rows = await this.selectCandidates(maxItems, minAgeSeconds, runId);
-    const hydrated = rows.map((row) => this.hydrate(row, requestedAt));
+    const hydrated = await Promise.all(rows.map((row) => this.hydrate(row, requestedAt)));
     const failed = hydrated.filter((candidate): candidate is TranslationReconciliationCandidate => "status" in candidate);
 
     if (failed.length > 0) {
@@ -1026,11 +1046,17 @@ export class PostgresTranslationOutboxReconciler implements TranslationReconcile
     return result.rows;
   }
 
-  private hydrate(row: TranslationOutboxRow, requestedAt: string): HydratedReplay | TranslationReconciliationCandidate {
+  private async hydrate(row: TranslationOutboxRow, requestedAt: string): Promise<HydratedReplay | TranslationReconciliationCandidate> {
     const baseCandidate = candidateFromRow(row, "confirmed-outbox-replay");
     const diagnostic = objectValue(row.diagnostic_metadata);
-    const payload = diagnostic.payload;
-    const envelope = diagnostic.envelope;
+    const recovered = await this.recoverMissingCarrier(row, diagnostic);
+
+    if (recovered.status === "failed") {
+      return failedCandidate(baseCandidate, recovered.reason);
+    }
+
+    const payload = recovered.status === "recovered" ? recovered.payload : diagnostic.payload;
+    const envelope = recovered.status === "recovered" ? recovered.envelope : diagnostic.envelope;
 
     if (!isRecord(payload)) {
       return failedCandidate(baseCandidate, "missing-stored-payload");
@@ -1086,6 +1112,460 @@ export class PostgresTranslationOutboxReconciler implements TranslationReconcile
         payload
       }
     };
+  }
+
+  private async recoverMissingCarrier(
+    row: TranslationOutboxRow,
+    diagnostic: Readonly<Record<string, unknown>>
+  ): Promise<RecoveryResult> {
+    if (isRecord(diagnostic.envelope)) {
+      return {
+        status: "not_applicable"
+      };
+    }
+
+    if (!isRecord(diagnostic.payload)) {
+      return {
+        status: "not_applicable"
+      };
+    }
+
+    if (row.destination_stage !== "persistence") {
+      return {
+        status: "not_applicable"
+      };
+    }
+
+    if (row.idempotency_key.startsWith("translation:persistence:")) {
+      return this.recoverPersistenceCarrier(row, diagnostic.payload);
+    }
+
+    if (row.idempotency_key.startsWith("translation:result:")) {
+      return this.recoverTranslationStatusCarrier(row, diagnostic.payload);
+    }
+
+    return {
+      status: "not_applicable"
+    };
+  }
+
+  private async recoverPersistenceCarrier(
+    row: TranslationOutboxRow,
+    diagnosticPayload: Readonly<Record<string, unknown>>
+  ): Promise<RecoveryResult> {
+    const resultId = row.idempotency_key.slice("translation:persistence:".length);
+
+    if (resultId.length === 0) {
+      return {
+        status: "failed",
+        reason: "invalid-legacy-result-id"
+      };
+    }
+
+    const result = await this.findReplayableResultSnapshotById(resultId);
+
+    if (result === undefined) {
+      return {
+        status: "failed",
+        reason: "missing-result-snapshot"
+      };
+    }
+
+    if (result.status !== "success") {
+      return {
+        status: "failed",
+        reason: "non-success-result-not-persistence-replayable"
+      };
+    }
+
+    const payload = this.persistencePayloadFromResult(row, result, diagnosticPayload);
+
+    if (payload === undefined) {
+      return {
+        status: "failed",
+        reason: "legacy-persistence-metadata-mismatch"
+      };
+    }
+
+    if (row.payload_digest !== sha256Json(payload)) {
+      return {
+        status: "failed",
+        reason: "payload-digest-mismatch"
+      };
+    }
+
+    const envelope = this.envelopeForRecoveredPersistencePayload(row, payload, result);
+
+    if (envelope === undefined) {
+      return {
+        status: "failed",
+        reason: "legacy-envelope-metadata-mismatch"
+      };
+    }
+
+    return {
+      status: "recovered",
+      payload,
+      envelope
+    };
+  }
+
+  private async recoverTranslationStatusCarrier(
+    row: TranslationOutboxRow,
+    diagnosticPayload: Readonly<Record<string, unknown>>
+  ): Promise<RecoveryResult> {
+    const payloadArticleId = stringFrom(diagnosticPayload.articleId, "");
+    const payloadVersion = row.operation_version;
+
+    if (payloadArticleId.length === 0 || payloadArticleId !== row.entity_id || !Number.isInteger(payloadVersion) || payloadVersion < 1) {
+      return {
+        status: "failed",
+        reason: "legacy-status-article-metadata-mismatch"
+      };
+    }
+
+    const results = await this.findReplayableResultSnapshotsForArticle(payloadArticleId, payloadVersion);
+
+    if (results.length === 0) {
+      return {
+        status: "failed",
+        reason: "missing-result-snapshot"
+      };
+    }
+
+    const payload = this.translationStatusPayloadFromResults(row, diagnosticPayload, results);
+
+    if (payload === undefined) {
+      return {
+        status: "failed",
+        reason: "legacy-status-metadata-mismatch"
+      };
+    }
+
+    if (row.payload_digest !== sha256Json(payload)) {
+      return {
+        status: "failed",
+        reason: "payload-digest-mismatch"
+      };
+    }
+
+    const envelope = this.envelopeForRecoveredStatusPayload(row, payload, results);
+
+    if (envelope === undefined) {
+      return {
+        status: "failed",
+        reason: "legacy-envelope-metadata-mismatch"
+      };
+    }
+
+    return {
+      status: "recovered",
+      payload,
+      envelope
+    };
+  }
+
+  private async findReplayableResultSnapshotById(resultId: string): Promise<TranslationStoredLanguageResult | undefined> {
+    const result = await this.options.pool.query<TranslationResultSnapshotRow>(
+      `SELECT diagnostic_metadata->'resultSnapshot' AS result_snapshot
+       FROM ${TRANSLATION_SCHEMA}.translation_records
+       WHERE diagnostic_metadata->>'resultId' = $1
+       ORDER BY translated_at ASC, id ASC
+       LIMIT 2`,
+      [
+        resultId
+      ]
+    );
+
+    if (result.rows.length !== 1) {
+      return undefined;
+    }
+
+    const snapshot = result.rows[0]?.result_snapshot;
+
+    return isReplayableTranslationResultSnapshot(snapshot) ? snapshot : undefined;
+  }
+
+  private async findReplayableResultSnapshotsForArticle(articleId: string, articleVersion: number): Promise<readonly TranslationStoredLanguageResult[]> {
+    const result = await this.options.pool.query<TranslationResultSnapshotRow>(
+      `SELECT diagnostic_metadata->'resultSnapshot' AS result_snapshot
+       FROM ${TRANSLATION_SCHEMA}.translation_records
+       WHERE article_identity_hash = $1
+         AND translation_version = $2
+       ORDER BY translated_at ASC, id ASC`,
+      [
+        articleId,
+        articleVersion
+      ]
+    );
+
+    const snapshots = result.rows.map((row) => row.result_snapshot);
+
+    return snapshots.every(isReplayableTranslationResultSnapshot) ? snapshots : [];
+  }
+
+  private persistencePayloadFromResult(
+    row: TranslationOutboxRow,
+    result: TranslationStoredLanguageResult,
+    diagnosticPayload: Readonly<Record<string, unknown>>
+  ): Readonly<Record<string, unknown>> | undefined {
+    const payloadRef = `backend://worker-uplift/translation/${encodeURIComponent(result.articleId)}/${encodeURIComponent(result.resultId)}`;
+    const stageExecutionId = stableUuid([
+      "persistence-command",
+      result.resultId
+    ]);
+
+    if (row.payload_ref !== payloadRef
+      || row.stage_execution_id !== stageExecutionId
+      || row.entity_kind !== "article"
+      || row.entity_id !== result.articleId
+      || row.operation_version !== result.articleVersion
+      || row.idempotency_key !== `translation:persistence:${result.resultId}`
+      || result.model !== this.options.config.qwen.model
+      || result.promptId !== this.options.config.qwen.promptId
+      || result.summaryRef === undefined
+      || result.qualityRef === undefined) {
+      return undefined;
+    }
+
+    const entityRef = {
+      articleId: result.articleId,
+      articleVersion: result.articleVersion,
+      sourceLanguage: result.sourceLanguage,
+      targetLanguage: result.targetLanguage,
+      summaryRef: orderedSummaryRef(result.summaryRef),
+      qualityRef: orderedQualityRef(result.qualityRef),
+      ...(result.aiUsageRef === undefined ? {} : {
+        aiUsageRef: orderedAiUsageRef(result.aiUsageRef)
+      })
+    };
+    const tracestate = optionalString(diagnosticPayload.tracestate);
+    const payload = {
+      schemaId: STAGE_PAYLOAD_SCHEMA_IDS.persistenceCommand,
+      schemaVersion: STAGE_PAYLOAD_SCHEMA_VERSION,
+      pipelineRunId: row.pipeline_run_id,
+      stageExecutionId,
+      sourceMessageId: result.sourceMessageId,
+      idempotencyKey: row.idempotency_key,
+      traceparent: result.traceparent,
+      ...(tracestate === undefined ? {} : {
+        tracestate
+      }),
+      producedAt: result.translatedAt,
+      commandId: result.resultId,
+      commandKind: "save_summaries",
+      backendOperation: "save-article-summaries-batch",
+      entityRefs: [
+        entityRef
+      ],
+      writeMode: "upsert",
+      providerMode: "backend_postgres_primary"
+    };
+
+    return validateStagePayload(payload).ok ? payload : undefined;
+  }
+
+  private translationStatusPayloadFromResults(
+    row: TranslationOutboxRow,
+    diagnosticPayload: Readonly<Record<string, unknown>>,
+    results: readonly TranslationStoredLanguageResult[]
+  ): Readonly<Record<string, unknown>> | undefined {
+    const articleId = stringFrom(diagnosticPayload.articleId, "");
+    const producedAt = optionalString(diagnosticPayload.producedAt);
+    const sourceMessageId = optionalString(diagnosticPayload.sourceMessageId);
+    const traceparent = optionalString(diagnosticPayload.traceparent);
+    const tracestate = optionalString(diagnosticPayload.tracestate);
+    const completedLanguageCodes = stringArray(diagnosticPayload.completedLanguageCodes);
+    const missingLanguageCodes = stringArray(diagnosticPayload.missingLanguageCodes);
+    const status = optionalString(diagnosticPayload.translationStatus);
+
+    if (producedAt === undefined
+      || sourceMessageId === undefined
+      || traceparent === undefined
+      || completedLanguageCodes === undefined
+      || missingLanguageCodes === undefined
+      || status === undefined
+      || articleId !== row.entity_id
+      || row.entity_kind !== "article"
+      || row.payload_ref !== `backend://worker-uplift/translation/${encodeURIComponent(articleId)}/translation-status`
+      || row.stage_execution_id !== stableUuid([
+        "translation-status",
+        articleId,
+        String(row.operation_version),
+        this.options.config.qwen.model
+      ])) {
+      return undefined;
+    }
+
+    const allLanguageCodes = [
+      ...completedLanguageCodes,
+      ...missingLanguageCodes
+    ];
+
+    if (new Set(allLanguageCodes).size !== allLanguageCodes.length
+      || allLanguageCodes.some((language) => !this.options.config.languagePolicy.targetLanguages.includes(language))) {
+      return undefined;
+    }
+
+    const matchingResults = results.filter((result) => allLanguageCodes.includes(result.targetLanguage));
+    const successfulLanguages = results
+      .filter((result) => this.options.config.languagePolicy.targetLanguages.includes(result.targetLanguage))
+      .filter((result) => result.status === "success")
+      .map((result) => result.targetLanguage);
+
+    if (!sameStringSet(successfulLanguages, completedLanguageCodes)
+      || !matchingResults.every((result) => result.articleId === articleId
+        && result.articleVersion === row.operation_version
+        && result.sourceMessageId === sourceMessageId
+        && result.traceparent === traceparent
+        && result.model === this.options.config.qwen.model
+        && result.promptId === this.options.config.qwen.promptId)) {
+      return undefined;
+    }
+
+    const expectedStatus = missingLanguageCodes.length === 0
+      ? "complete"
+      : matchingResults.some((result) => missingLanguageCodes.includes(result.targetLanguage) && result.status === "permanent_failure")
+        ? "permanent_failure"
+        : "partial";
+
+    if (status !== expectedStatus) {
+      return undefined;
+    }
+
+    const summaryRefs: NonNullable<TranslationStoredLanguageResult["summaryRef"]>[] = [];
+
+    for (const language of completedLanguageCodes) {
+      const result = matchingResults.find((item) => item.targetLanguage === language);
+
+      if (result?.summaryRef === undefined) {
+        return undefined;
+      }
+
+      summaryRefs.push(orderedSummaryRef(result.summaryRef));
+    }
+
+    const payload = {
+      schemaId: STAGE_PAYLOAD_SCHEMA_IDS.translationResult,
+      schemaVersion: STAGE_PAYLOAD_SCHEMA_VERSION,
+      pipelineRunId: row.pipeline_run_id,
+      stageExecutionId: row.stage_execution_id,
+      sourceMessageId,
+      idempotencyKey: row.idempotency_key,
+      traceparent,
+      ...(tracestate === undefined ? {} : {
+        tracestate
+      }),
+      producedAt,
+      articleId,
+      translationStatus: status,
+      completedLanguageCodes,
+      missingLanguageCodes,
+      summaryRefs
+    };
+
+    return validateStagePayload(payload).ok ? payload : undefined;
+  }
+
+  private envelopeForRecoveredPersistencePayload(
+    row: TranslationOutboxRow,
+    payload: Readonly<Record<string, unknown>>,
+    result: TranslationStoredLanguageResult
+  ): WorkerMessageEnvelope | undefined {
+    const tracestate = optionalString(payload.tracestate);
+
+    return this.envelopeForRecoveredPayload(row, payload, {
+      causationId: result.sourceMessageId,
+      correlationId: result.correlationId,
+      traceparent: result.traceparent,
+      ...(tracestate === undefined ? {} : {
+        tracestate
+      }),
+      occurredAt: result.translatedAt
+    });
+  }
+
+  private envelopeForRecoveredStatusPayload(
+    row: TranslationOutboxRow,
+    payload: Readonly<Record<string, unknown>>,
+    results: readonly TranslationStoredLanguageResult[]
+  ): WorkerMessageEnvelope | undefined {
+    const sourceMessageId = optionalString(payload.sourceMessageId);
+    const traceparent = optionalString(payload.traceparent);
+    const correlations = new Set(results.map((result) => result.correlationId));
+
+    if (sourceMessageId === undefined || traceparent === undefined || correlations.size !== 1) {
+      return undefined;
+    }
+
+    const correlationId = results[0]?.correlationId;
+
+    if (correlationId === undefined) {
+      return undefined;
+    }
+
+    const tracestate = optionalString(payload.tracestate);
+
+    return this.envelopeForRecoveredPayload(row, payload, {
+      causationId: sourceMessageId,
+      correlationId,
+      traceparent,
+      ...(tracestate === undefined ? {} : {
+        tracestate
+      }),
+      occurredAt: optionalString(payload.producedAt) ?? row.confirmed_at?.toISOString() ?? row.created_at.toISOString()
+    });
+  }
+
+  private envelopeForRecoveredPayload(
+    row: TranslationOutboxRow,
+    payload: Readonly<Record<string, unknown>>,
+    metadata: {
+      readonly causationId: string;
+      readonly correlationId: string;
+      readonly traceparent: string;
+      readonly tracestate?: string;
+      readonly occurredAt: string;
+    }
+  ): WorkerMessageEnvelope | undefined {
+    const route = getWorkerRoute("persistence");
+    const envelope = {
+      schemaId: route.schemaId,
+      schemaVersion: row.schema_version,
+      route: "persistence",
+      messageId: row.outbox_message_id,
+      causationId: metadata.causationId,
+      correlationId: metadata.correlationId,
+      traceparent: metadata.traceparent,
+      ...(metadata.tracestate === undefined ? {} : {
+        tracestate: metadata.tracestate
+      }),
+      idempotencyKey: row.idempotency_key,
+      aggregate: {
+        type: row.entity_kind,
+        id: row.entity_id,
+        version: row.operation_version
+      },
+      occurredAt: metadata.occurredAt,
+      attempt: {
+        count: 1,
+        max: WORKER_DELIVERY_BEHAVIOR.maxAttempts,
+        firstAttemptAt: metadata.occurredAt
+      },
+      producer: {
+        name: this.options.config.serviceName,
+        version: this.options.config.serviceVersion
+      },
+      payloadRef: {
+        kind: "backend-record",
+        uri: row.payload_ref,
+        mediaType: "application/json",
+        sizeBytes: getStagePayloadSizeBytes(payload)
+      }
+    };
+    const validation = validateWorkerEnvelope(envelope);
+
+    return validation.ok && validation.value.route === row.destination_stage ? validation.value : undefined;
   }
 
   private async recordReplay(
@@ -1886,10 +2366,98 @@ function isTranslationResultSnapshot(value: unknown): value is TranslationStored
     && typeof value.articleVersion === "number"
     && typeof value.sourceLanguage === "string"
     && typeof value.targetLanguage === "string"
-    && typeof value.status === "string"
+    && (value.status === "success" || value.status === "permanent_failure")
     && typeof value.model === "string"
     && typeof value.promptId === "string"
     && typeof value.promptVersion === "string";
+}
+
+function isReplayableTranslationResultSnapshot(value: unknown): value is TranslationStoredLanguageResult {
+  if (!isTranslationResultSnapshot(value)
+    || typeof value.sourceMessageId !== "string"
+    || typeof value.correlationId !== "string"
+    || typeof value.traceparent !== "string"
+    || typeof value.latencyMs !== "number"
+    || typeof value.translatedAt !== "string"
+    || (value.failureReason !== undefined && typeof value.failureReason !== "string")
+    || (value.summaryRef !== undefined && !isTranslationSummaryRef(value.summaryRef))
+    || !isTranslationQualityRef(value.qualityRef)
+    || (value.aiUsageRef !== undefined && !isTranslationAiUsageRef(value.aiUsageRef))
+    || (value.persistencePublication !== undefined && !isPersistencePublication(value.persistencePublication))) {
+    return false;
+  }
+
+  return value.status === "success" ? value.summaryRef !== undefined : true;
+}
+
+function orderedSummaryRef(
+  ref: NonNullable<TranslationStoredLanguageResult["summaryRef"]>
+): NonNullable<TranslationStoredLanguageResult["summaryRef"]> {
+  return {
+    kind: "backend-record",
+    uri: ref.uri,
+    mediaType: "application/json",
+    articleId: ref.articleId,
+    targetLanguage: ref.targetLanguage,
+    resultId: ref.resultId
+  };
+}
+
+function orderedQualityRef(
+  ref: NonNullable<TranslationStoredLanguageResult["qualityRef"]>
+): NonNullable<TranslationStoredLanguageResult["qualityRef"]> {
+  return {
+    kind: "backend-record",
+    uri: ref.uri,
+    mediaType: "application/json",
+    qualityScore: ref.qualityScore,
+    resultId: ref.resultId
+  };
+}
+
+function orderedAiUsageRef(
+  ref: NonNullable<TranslationStoredLanguageResult["aiUsageRef"]>
+): NonNullable<TranslationStoredLanguageResult["aiUsageRef"]> {
+  return {
+    kind: "backend-record",
+    uri: ref.uri,
+    mediaType: "application/json",
+    inputTokens: ref.inputTokens,
+    outputTokens: ref.outputTokens,
+    totalTokens: ref.totalTokens
+  };
+}
+
+function optionalString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value : undefined;
+}
+
+function stringArray(value: unknown): readonly string[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+
+  const output: string[] = [];
+
+  for (const item of value) {
+    if (typeof item !== "string" || item.length === 0) {
+      return undefined;
+    }
+
+    output.push(item);
+  }
+
+  return output;
+}
+
+function sameStringSet(left: readonly string[], right: readonly string[]): boolean {
+  if (left.length !== right.length) {
+    return false;
+  }
+
+  const rightSet = new Set(right);
+
+  return left.every((value) => rightSet.has(value));
 }
 
 function isPersistencePublication(value: unknown): value is TranslationPersistencePublication {

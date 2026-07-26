@@ -29,6 +29,9 @@ import {
   PostgresTranslationOutboxReconciler
 } from "../src/production.js";
 import { TRANSLATION_RECONCILIATION_CONFIRMATION } from "../src/reconciliation.js";
+import { stableUuid } from "../src/ids.js";
+import type { TranslationConfig } from "../src/config.js";
+import type { TranslationStoredLanguageResult } from "../src/dependencies.js";
 
 const now = "2026-07-23T00:00:00.000Z";
 const clock = {
@@ -78,7 +81,8 @@ describe("translation outbox reconciliation", () => {
       pool: pool.asPool(),
       brokerTransport: transport,
       clock,
-      env: {}
+      env: {},
+      config: testConfig
     });
 
     const report = await reconciler.reconcile({
@@ -116,7 +120,8 @@ describe("translation outbox reconciliation", () => {
       clock,
       env: {
         NUTSNEWS_TRANSLATION_RECONCILIATION_APPLY_ENABLED: "true"
-      }
+      },
+      config: testConfig
     });
 
     const report = await reconciler.reconcile({
@@ -143,7 +148,7 @@ describe("translation outbox reconciliation", () => {
     expect(pool.queries.some((query) => query.sql.includes("reconciliationAuditHistory"))).toBe(true);
   });
 
-  it("fails closed without publishing when the authoritative envelope is missing", async () => {
+  it("fails closed without publishing when a legacy envelope cannot be recovered from service storage", async () => {
     const command = persistenceCommand();
     const row = {
       ...outboxRow(command),
@@ -162,7 +167,8 @@ describe("translation outbox reconciliation", () => {
       clock,
       env: {
         NUTSNEWS_TRANSLATION_RECONCILIATION_APPLY_ENABLED: "true"
-      }
+      },
+      config: testConfig
     });
 
     const report = await reconciler.reconcile({
@@ -172,11 +178,110 @@ describe("translation outbox reconciliation", () => {
     });
 
     expect(report.status).toBe("failed_closed");
-    expect(report.errors).toContain("1:missing-stored-envelope");
+    expect(report.errors).toContain("1:missing-result-snapshot");
     expect(report.writesPerformed).toBe(false);
     expect(transport.published).toHaveLength(0);
   });
+
+  it("recovers a legacy persistence row from translation_records without reusing the original message ID", async () => {
+    const result = storedResultSnapshot();
+    const command = legacyPersistenceCommand(result);
+    const pool = new FakePool([
+      {
+        ...outboxRow(command),
+        diagnostic_metadata: {
+          payload: jsonbLikePersistencePayload(command.payload),
+          payloadSchemaId: command.payload.schemaId,
+          exchange: getWorkerRoute("persistence").exchange
+        }
+      }
+    ], [
+      {
+        result_snapshot: result
+      }
+    ]);
+    const transport = new FakeBrokerTransport();
+    const reconciler = new PostgresTranslationOutboxReconciler({
+      pool: pool.asPool(),
+      brokerTransport: transport,
+      clock,
+      env: {
+        NUTSNEWS_TRANSLATION_RECONCILIATION_APPLY_ENABLED: "true"
+      },
+      config: testConfig
+    });
+
+    const report = await reconciler.reconcile({
+      mode: "apply",
+      runId: "recovery-legacy-translation",
+      reason: "empty broker recovery",
+      protectedConfirmation: TRANSLATION_RECONCILIATION_CONFIRMATION
+    });
+
+    expect(report).toMatchObject({
+      status: "applied",
+      selectedCount: 1,
+      replayedCount: 1,
+      writesPerformed: true,
+      productionVisibilityEnabled: false
+    });
+    expect(transport.published).toHaveLength(1);
+    const replay = transport.published[0];
+    expect(replay?.payload).toEqual(command.payload);
+    expect(replay?.envelope.messageId).not.toBe(command.envelope.messageId);
+    expect(replay?.envelope.idempotencyKey).toBe(command.envelope.idempotencyKey);
+    expect(replay?.envelope.correlationId).toBe(command.envelope.correlationId);
+    expect(replay?.envelope.causationId).toBe(command.envelope.causationId);
+    expect(replay?.envelope.aggregate).toEqual(command.envelope.aggregate);
+  });
 });
+
+const testConfig: TranslationConfig = {
+  serviceName: "nutsnews-worker-article-translation",
+  serviceVersion: "0.1.0",
+  environment: "test",
+  host: "test-host",
+  http: {
+    host: "127.0.0.1",
+    port: 0
+  },
+  dependencyMode: "test",
+  dependencies: {
+    databaseConfigured: true,
+    rabbitmqConfigured: true,
+    qwenEndpointConfigured: true,
+    qwenCredentialConfigured: true
+  },
+  qwen: {
+    model: "qwen2.5:3b",
+    promptId: "summary-translation-v1",
+    totalTimeoutMs: 30_000,
+    maxInputBytes: 32_768
+  },
+  languagePolicy: {
+    policyId: "required-summaries-v1",
+    targetLanguages: [
+      "fr",
+      "ja",
+      "de-CH",
+      "de",
+      "el"
+    ],
+    perLanguageConcurrency: 1
+  },
+  quality: {
+    minScore: 80,
+    minSummaryChars: 24,
+    maxSummaryChars: 420,
+    repromptMaxAttempts: 2
+  },
+  concurrency: 2,
+  prefetch: 4,
+  shutdownTimeoutMs: 30_000,
+  shadowMode: true,
+  telemetryLogs: "silent",
+  metricsEnabled: true
+};
 
 function persistenceCommand(): BrokerPublishCommand {
   const route = getWorkerRoute("persistence");
@@ -269,6 +374,149 @@ function outboxRow(command: BrokerPublishCommand): QueryResultRow {
   };
 }
 
+function storedResultSnapshot(): TranslationStoredLanguageResult {
+  const resultId = stableUuid([
+    "article-001",
+    "1",
+    "en",
+    "fr",
+    "summary-translation-v1",
+    "0.1.0",
+    "qwen2.5:3b"
+  ]);
+
+  return {
+    resultId,
+    articleId: "article-001",
+    articleVersion: 1,
+    sourceLanguage: "en",
+    targetLanguage: "fr",
+    promptId: "summary-translation-v1",
+    promptVersion: "0.1.0",
+    model: "qwen2.5:3b",
+    status: "success",
+    summaryRef: {
+      kind: "backend-record",
+      uri: `backend://worker-uplift/translation/article-001/${resultId}/fr/summary`,
+      mediaType: "application/json",
+      articleId: "article-001",
+      targetLanguage: "fr",
+      resultId
+    },
+    qualityRef: {
+      kind: "backend-record",
+      uri: `backend://worker-uplift/translation/article-001/${resultId}/fr/quality`,
+      mediaType: "application/json",
+      qualityScore: 92,
+      resultId
+    },
+    aiUsageRef: {
+      kind: "backend-record",
+      uri: `backend://worker-uplift/translation/article-001/${resultId}/fr/ai-usage`,
+      mediaType: "application/json",
+      inputTokens: 20,
+      outputTokens: 12,
+      totalTokens: 32
+    },
+    sourceMessageId: "018f1598-2dd5-7c4f-9f92-8f7a7f8b3503",
+    correlationId: "018f1598-2dd5-7c4f-9f92-8f7a7f8b3500",
+    traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+    latencyMs: 100,
+    translatedAt: now
+  };
+}
+
+function legacyPersistenceCommand(result: TranslationStoredLanguageResult): BrokerPublishCommand {
+  const route = getWorkerRoute("persistence");
+  const payload = {
+    schemaId: STAGE_PAYLOAD_SCHEMA_IDS.persistenceCommand,
+    schemaVersion: STAGE_PAYLOAD_SCHEMA_VERSION,
+    pipelineRunId: "018f1598-2dd5-7c4f-9f92-8f7a7f8b3501",
+    stageExecutionId: stableUuid([
+      "persistence-command",
+      result.resultId
+    ]),
+    sourceMessageId: result.sourceMessageId,
+    idempotencyKey: `translation:persistence:${result.resultId}`,
+    traceparent: result.traceparent,
+    producedAt: result.translatedAt,
+    commandId: result.resultId,
+    commandKind: "save_summaries",
+    backendOperation: "save-article-summaries-batch",
+    entityRefs: [
+      {
+        articleId: result.articleId,
+        articleVersion: result.articleVersion,
+        sourceLanguage: result.sourceLanguage,
+        targetLanguage: result.targetLanguage,
+        summaryRef: result.summaryRef,
+        qualityRef: result.qualityRef,
+        aiUsageRef: result.aiUsageRef
+      }
+    ],
+    writeMode: "upsert",
+    providerMode: "backend_postgres_primary"
+  };
+  const envelope = assertWorkerEnvelope({
+    schemaId: route.schemaId,
+    schemaVersion: 1,
+    route: "persistence",
+    messageId: stableUuid([
+      "persistence-message",
+      payload.idempotencyKey
+    ]),
+    causationId: result.sourceMessageId,
+    correlationId: result.correlationId,
+    traceparent: result.traceparent,
+    idempotencyKey: payload.idempotencyKey,
+    aggregate: {
+      type: "article",
+      id: result.articleId,
+      version: result.articleVersion
+    },
+    occurredAt: result.translatedAt,
+    attempt: {
+      count: 1,
+      max: WORKER_DELIVERY_BEHAVIOR.maxAttempts,
+      firstAttemptAt: result.translatedAt
+    },
+    producer: {
+      name: "nutsnews-worker-article-translation",
+      version: "0.1.0"
+    },
+    payloadRef: {
+      kind: "backend-record",
+      uri: `backend://worker-uplift/translation/${encodeURIComponent(result.articleId)}/${encodeURIComponent(result.resultId)}`,
+      mediaType: "application/json",
+      sizeBytes: getStagePayloadSizeBytes(payload)
+    }
+  });
+
+  return {
+    envelope,
+    payload
+  };
+}
+
+function jsonbLikePersistencePayload(payload: BrokerPublishCommand["payload"]): Readonly<Record<string, unknown>> {
+  return {
+    schemaId: payload.schemaId,
+    commandId: payload.commandId,
+    writeMode: payload.writeMode,
+    entityRefs: payload.entityRefs,
+    producedAt: payload.producedAt,
+    commandKind: payload.commandKind,
+    traceparent: payload.traceparent,
+    providerMode: payload.providerMode,
+    pipelineRunId: payload.pipelineRunId,
+    schemaVersion: payload.schemaVersion,
+    idempotencyKey: payload.idempotencyKey,
+    sourceMessageId: payload.sourceMessageId,
+    backendOperation: payload.backendOperation,
+    stageExecutionId: payload.stageExecutionId
+  };
+}
+
 function sha256Json(value: unknown): string {
   return `sha256:${createHash("sha256").update(JSON.stringify(value)).digest("hex")}`;
 }
@@ -286,7 +534,10 @@ function firstQuery(pool: FakePool): { readonly sql: string; readonly values: re
 class FakePool {
   readonly queries: { readonly sql: string; readonly values: readonly unknown[] }[] = [];
 
-  constructor(private readonly rows: readonly QueryResultRow[]) {}
+  constructor(
+    private readonly rows: readonly QueryResultRow[],
+    private readonly snapshotRows: readonly QueryResultRow[] = []
+  ) {}
 
   asPool() {
     return this as never;
@@ -297,6 +548,13 @@ class FakePool {
       sql,
       values
     });
+
+    if (sql.includes("worker_uplift_translation.translation_records")) {
+      return Promise.resolve({
+        rows: [...this.snapshotRows],
+        rowCount: this.snapshotRows.length
+      });
+    }
 
     if (sql.trimStart().startsWith("SELECT")) {
       return Promise.resolve({
