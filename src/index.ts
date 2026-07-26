@@ -20,6 +20,7 @@ import { createProductionTranslationDependencies } from "./production.js";
 import { createTranslationService } from "./service.js";
 import { createLocalTranslationDependencies } from "./test-doubles.js";
 import { createArticleTranslationWorkHandler } from "./translation.js";
+import type { TranslationReconciler } from "./reconciliation.js";
 
 export {
   TRANSLATION_CONFIG_SCHEMA,
@@ -59,6 +60,14 @@ export {
   type TranslationHttpServer
 } from "./http.js";
 export {
+  TRANSLATION_RECONCILIATION_CONFIRMATION,
+  TRANSLATION_RECONCILIATION_PATH,
+  type TranslationReconciliationCandidate,
+  type TranslationReconciliationReport,
+  type TranslationReconciliationRequest,
+  type TranslationReconciler
+} from "./reconciliation.js";
+export {
   createTranslationPrometheusMetricsSink,
   type TranslationPrometheusMetricsSink
 } from "./metrics.js";
@@ -66,6 +75,7 @@ export {
   LocalAiTranslationQwenClient,
   PayloadRabbitMqTransport,
   PostgresTranslationBrokerOutbox,
+  PostgresTranslationOutboxReconciler,
   PostgresTranslationStateStore,
   PostgresTranslationTransactionRunner,
   StaticTranslationLanguagePolicy,
@@ -159,6 +169,12 @@ export function createTranslationApplication(config = loadTranslationConfig()): 
   const httpServer = createTranslationHttpServer({
     config,
     service,
+    ...(hasReconciler(baseDependencies) ? {
+      reconciler: baseDependencies.reconciler
+    } : {}),
+    ...(hasReconciliationToken(baseDependencies) ? {
+      reconciliationToken: baseDependencies.reconciliationToken
+    } : {}),
     ...(metrics === undefined ? {} : {
       metrics
     })
@@ -207,6 +223,22 @@ function hasDependencyCloser(
   const candidate = dependencies as Partial<{ readonly close: unknown }>;
 
   return typeof candidate.close === "function";
+}
+
+function hasReconciler(
+  dependencies: TranslationDependencies
+): dependencies is TranslationDependencies & { readonly reconciler: TranslationReconciler } {
+  const candidate = dependencies as Partial<{ readonly reconciler: unknown }>;
+
+  return typeof candidate.reconciler === "object" && candidate.reconciler !== null;
+}
+
+function hasReconciliationToken(
+  dependencies: TranslationDependencies
+): dependencies is TranslationDependencies & { readonly reconciliationToken: string } {
+  const candidate = dependencies as Partial<{ readonly reconciliationToken: unknown }>;
+
+  return typeof candidate.reconciliationToken === "string" && candidate.reconciliationToken.length > 0;
 }
 
 function combineTelemetrySinks(
