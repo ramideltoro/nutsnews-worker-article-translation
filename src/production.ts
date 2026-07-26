@@ -1444,26 +1444,79 @@ export class PostgresTranslationOutboxReconciler implements TranslationReconcile
       summaryRefs.push(orderedSummaryRef(result.summaryRef));
     }
 
-    const payload = {
-      schemaId: STAGE_PAYLOAD_SCHEMA_IDS.translationResult,
-      schemaVersion: STAGE_PAYLOAD_SCHEMA_VERSION,
-      pipelineRunId: row.pipeline_run_id,
-      stageExecutionId: row.stage_execution_id,
+    const payload = this.translationStatusPayload(row, {
+      articleId,
+      producedAt,
       sourceMessageId,
-      idempotencyKey: row.idempotency_key,
       traceparent,
       ...(tracestate === undefined ? {} : {
         tracestate
       }),
-      producedAt,
-      articleId,
-      translationStatus: status,
+      status,
       completedLanguageCodes,
       missingLanguageCodes,
       summaryRefs
-    };
+    });
 
-    return validateStagePayload(payload).ok ? payload : undefined;
+    if (row.payload_digest === sha256Json(payload)) {
+      return validateStagePayload(payload).ok ? payload : undefined;
+    }
+
+    const diagnosticSummaryRefs = summaryRefArray(diagnosticPayload.summaryRefs);
+
+    if (diagnosticSummaryRefs === undefined || !sameSummaryRefs(summaryRefs, diagnosticSummaryRefs)) {
+      return validateStagePayload(payload).ok ? payload : undefined;
+    }
+
+    const diagnosticPayloadCandidate = this.translationStatusPayload(row, {
+      articleId,
+      producedAt,
+      sourceMessageId,
+      traceparent,
+      ...(tracestate === undefined ? {} : {
+        tracestate
+      }),
+      status,
+      completedLanguageCodes,
+      missingLanguageCodes,
+      summaryRefs: diagnosticSummaryRefs
+    });
+
+    return validateStagePayload(diagnosticPayloadCandidate).ok ? diagnosticPayloadCandidate : undefined;
+  }
+
+  private translationStatusPayload(
+    row: TranslationOutboxRow,
+    input: {
+      readonly articleId: string;
+      readonly producedAt: string;
+      readonly sourceMessageId: string;
+      readonly traceparent: string;
+      readonly tracestate?: string;
+      readonly status: string;
+      readonly completedLanguageCodes: readonly string[];
+      readonly missingLanguageCodes: readonly string[];
+      readonly summaryRefs: readonly NonNullable<TranslationStoredLanguageResult["summaryRef"]>[];
+    }
+  ): Readonly<Record<string, unknown>> {
+    return {
+      schemaId: STAGE_PAYLOAD_SCHEMA_IDS.translationResult,
+      schemaVersion: STAGE_PAYLOAD_SCHEMA_VERSION,
+      pipelineRunId: row.pipeline_run_id,
+      stageExecutionId: row.stage_execution_id,
+      sourceMessageId: input.sourceMessageId,
+      idempotencyKey: row.idempotency_key,
+      traceparent: input.traceparent,
+      ...(input.tracestate === undefined ? {} : {
+        tracestate: input.tracestate
+      }),
+      producedAt: input.producedAt,
+      articleId: input.articleId,
+      translationStatus: input.status,
+      completedLanguageCodes: input.completedLanguageCodes,
+      missingLanguageCodes: input.missingLanguageCodes,
+      summaryRefs: input.summaryRefs
+    };
   }
 
   private envelopeForRecoveredPersistencePayload(
@@ -2449,6 +2502,24 @@ function stringArray(value: unknown): readonly string[] | undefined {
   return output;
 }
 
+function summaryRefArray(value: unknown): readonly NonNullable<TranslationStoredLanguageResult["summaryRef"]>[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+
+  const output: NonNullable<TranslationStoredLanguageResult["summaryRef"]>[] = [];
+
+  for (const item of value) {
+    if (!isTranslationSummaryRef(item)) {
+      return undefined;
+    }
+
+    output.push(item);
+  }
+
+  return output;
+}
+
 function sameStringSet(left: readonly string[], right: readonly string[]): boolean {
   if (left.length !== right.length) {
     return false;
@@ -2457,6 +2528,28 @@ function sameStringSet(left: readonly string[], right: readonly string[]): boole
   const rightSet = new Set(right);
 
   return left.every((value) => rightSet.has(value));
+}
+
+function sameSummaryRefs(
+  left: readonly NonNullable<TranslationStoredLanguageResult["summaryRef"]>[],
+  right: readonly NonNullable<TranslationStoredLanguageResult["summaryRef"]>[]
+): boolean {
+  if (left.length !== right.length) {
+    return false;
+  }
+
+  return left.every((ref, index) => {
+    const other = right[index];
+
+    if (other === undefined) {
+      return false;
+    }
+
+    return ref.uri === other.uri
+      && ref.articleId === other.articleId
+      && ref.targetLanguage === other.targetLanguage
+      && ref.resultId === other.resultId;
+  });
 }
 
 function isPersistencePublication(value: unknown): value is TranslationPersistencePublication {
