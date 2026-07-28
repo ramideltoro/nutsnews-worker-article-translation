@@ -21,7 +21,8 @@ The worker records one independently replayable result per article version, sour
 - Configures low default prefetch and concurrency, plus per-language concurrency for Qwen-bound translation work.
 - Uses shared runtime broker lifecycle, in-flight drain, idempotency store, retry/DLQ destinations, health reports, and Prometheus metrics.
 - Exposes runtime metrics plus bounded per-language translation metrics for provider, language, result, retry class, latency, and token counts.
-- Keeps liveness independent from Qwen, prompt registry, language policy, and quality validator readiness; `/live` only checks process health, while `/ready` gates broker, state, outbox, Qwen, prompt registry, language policy, quality validator, and shadow mode.
+- Keeps liveness independent from Qwen, prompt registry, language policy, and quality validator readiness; `/live` only checks process health, while `/ready` gates an active `translation` main-queue consumer, broker, state, outbox, Qwen, prompt registry, language policy, quality validator, and shadow mode.
+- Emits bounded structured events and Prometheus metrics when RabbitMQ cancels the consumer, drops its channel, or restores consumption.
 - Contains no approval decision, article persistence, or publication logic.
 
 ## Configuration

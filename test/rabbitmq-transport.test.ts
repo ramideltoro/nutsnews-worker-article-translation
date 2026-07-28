@@ -8,6 +8,7 @@ import {
   expect,
   it
 } from "vitest";
+import { createBufferedRuntimeTelemetrySink } from "@ramideltoro/nutsnews-worker-runtime";
 
 import { PayloadRabbitMqTransport } from "../src/production.js";
 
@@ -74,11 +75,13 @@ describe("RabbitMQ payload transport", () => {
 
   it("reinstalls consumers cancelled by RabbitMQ without reconnecting", async () => {
     const broker = createFakeBroker();
+    const telemetry = createBufferedRuntimeTelemetrySink();
     const transport = new PayloadRabbitMqTransport({
       url: "amqp://translation:test@example.invalid:5672",
       prefetch: 2,
       clock,
-      connect: broker.connect
+      connect: broker.connect,
+      telemetry
     });
 
     await transport.consume("translation", () => Promise.resolve({
@@ -87,6 +90,11 @@ describe("RabbitMQ payload transport", () => {
     }));
 
     broker.connections[0]?.channel.emitConsumerCancel();
+    expect(telemetry.events).toContainEqual(expect.objectContaining({
+      name: "runtime.broker.consumer_state_changed",
+      outcome: "cancelled",
+      stage: "translation"
+    }));
     await waitForCondition(() => broker.connections[0]?.channel.consumeQueues.length === 2);
 
     expect(broker.connections).toHaveLength(1);
@@ -98,6 +106,10 @@ describe("RabbitMQ payload transport", () => {
       2,
       2
     ]);
+    expect(transport.consumerStatus("translation")).toMatchObject({
+      state: "active",
+      activeConsumers: 1
+    });
   });
 });
 

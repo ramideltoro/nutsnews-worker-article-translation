@@ -141,7 +141,10 @@ export function createTranslationApplication(config = loadTranslationConfig()): 
   const baseDependencies = config.dependencyMode === "production"
     ? createProductionTranslationDependencies({
         config,
-        clock: SYSTEM_RUNTIME_CLOCK
+        clock: SYSTEM_RUNTIME_CLOCK,
+        ...(telemetry === undefined ? {} : {
+          telemetry
+        })
       })
     : createLocalTranslationDependencies({
         clock: SYSTEM_RUNTIME_CLOCK

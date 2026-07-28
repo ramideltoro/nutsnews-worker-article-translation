@@ -15,11 +15,14 @@ import {
 } from "@ramideltoro/nutsnews-worker-contracts";
 import {
   computeRetryJitterMs,
+  createBrokerConsumerMonitor,
   createRetryEnvelope,
   randomUuidMessageIdFactory,
   runtimeNow,
   runtimeTraceHeadersFromEnvelope,
   type BrokerConsumerHandle,
+  type BrokerConsumerMonitor,
+  type BrokerConsumerStatus,
   type BrokerDeliveryHandler,
   type BrokerPublishCommand,
   type BrokerPublishReceipt,
@@ -29,7 +32,8 @@ import {
   type RuntimeIdempotencyClaimResult,
   type RuntimeIdempotencyCompletion,
   type RuntimeIdempotencyFailure,
-  type RuntimeMessageProcessingResult
+  type RuntimeMessageProcessingResult,
+  type RuntimeTelemetrySink
 } from "@ramideltoro/nutsnews-worker-runtime";
 import {
   connect as amqpConnect,
@@ -92,6 +96,7 @@ export type ProductionTranslationDependencies = TranslationDependencies & {
 interface ProductionTranslationDependencyOptions {
   readonly config: TranslationConfig;
   readonly clock: RuntimeClock;
+  readonly telemetry?: RuntimeTelemetrySink;
   readonly env?: NodeJS.ProcessEnv;
   readonly workHandler?: TranslationWorkHandler;
 }
@@ -103,6 +108,7 @@ interface PayloadCarrier {
 
 interface PayloadConsumerRegistration {
   readonly handler: BrokerDeliveryHandler;
+  readonly monitor: BrokerConsumerMonitor;
   consumerTag: string | undefined;
 }
 
@@ -131,7 +137,10 @@ export function createProductionTranslationDependencies(
   const brokerTransport = new PayloadRabbitMqTransport({
     url: requiredEnv(env, "NUTSNEWS_TRANSLATION_RABBITMQ_URL"),
     prefetch: options.config.prefetch,
-    clock: options.clock
+    clock: options.clock,
+    ...(options.telemetry === undefined ? {} : {
+      telemetry: options.telemetry
+    })
   });
   const stateStore = new PostgresTranslationStateStore(pool);
   const transactionRunner = new PostgresTranslationTransactionRunner(pool);
@@ -178,6 +187,7 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
   private readonly url: string;
   private readonly prefetchCount: number;
   private readonly clock: RuntimeClock;
+  private readonly telemetry: RuntimeTelemetrySink | undefined;
   private readonly connectToBroker: RabbitMqConnect;
   private readonly consumers = new Map<WorkerStage, PayloadConsumerRegistration>();
   private readonly inFlight = new Set<Promise<void>>();
@@ -192,16 +202,22 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
     readonly url: string;
     readonly prefetch: number;
     readonly clock: RuntimeClock;
+    readonly telemetry?: RuntimeTelemetrySink;
     readonly connect?: RabbitMqConnect;
   }) {
     this.url = options.url;
     this.prefetchCount = options.prefetch;
     this.clock = options.clock;
+    this.telemetry = options.telemetry;
     this.connectToBroker = options.connect ?? amqpConnect;
   }
 
   get inFlightDeliveryCount(): number {
     return this.inFlight.size;
+  }
+
+  consumerStatus(stage: WorkerStage): BrokerConsumerStatus | undefined {
+    return this.consumers.get(stage)?.monitor.status;
   }
 
   async connect(): Promise<void> {
@@ -243,12 +259,20 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
     const existing = this.consumers.get(stage);
 
     if (existing?.consumerTag !== undefined) {
+      existing.monitor.markClosed("consumer-replaced");
       await channel.cancel(existing.consumerTag).catch(() => undefined);
     }
 
     const registration: PayloadConsumerRegistration = {
       handler,
-      consumerTag: undefined
+      consumerTag: undefined,
+      monitor: createBrokerConsumerMonitor({
+        stage,
+        clock: this.clock,
+        ...(this.telemetry === undefined ? {} : {
+          telemetry: this.telemetry
+        })
+      })
     };
     this.consumers.set(stage, registration);
     await this.activateConsumer(stage, registration, channel);
@@ -258,6 +282,7 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
       cancel: async (): Promise<void> => {
         const registered = this.consumers.get(stage);
         this.consumers.delete(stage);
+        registered?.monitor.markClosed("consumer-handle-cancelled");
 
         if (registered?.consumerTag !== undefined && this.channel !== undefined) {
           await this.channel.cancel(registered.consumerTag).catch(() => undefined);
@@ -291,6 +316,7 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
         if (registration.consumerTag !== undefined) {
           await channel.cancel(registration.consumerTag).catch(() => undefined);
         }
+        registration.monitor.markClosed("transport-closing");
       }
     }
 
@@ -328,10 +354,20 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
         this.connection = undefined;
       }
 
-      this.markChannelClosed(channel);
+      this.markChannelClosed(channel, "connection-closed");
+    });
+    connection.on("error", () => {
+      if (this.connection === connection) {
+        this.connection = undefined;
+      }
+
+      this.markChannelClosed(channel, "connection-error");
     });
     channel.on("close", () => {
-      this.markChannelClosed(channel);
+      this.markChannelClosed(channel, "channel-closed");
+    });
+    channel.on("error", () => {
+      this.markChannelClosed(channel, "channel-error");
     });
 
     await this.restoreConsumers(channel);
@@ -355,10 +391,12 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
     }
 
     const route = getWorkerRoute(stage);
+    registration.monitor.markRecovering("consumer-activation");
     await channel.prefetch(this.prefetchCount);
     const reply = await channel.consume(route.mainQueue.name, (message) => {
       if (message === null) {
         registration.consumerTag = undefined;
+        registration.monitor.markCancelled("broker-cancelled-consumer");
         this.recoverCancelledConsumer(stage, registration, channel);
         return;
       }
@@ -373,9 +411,10 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
     });
 
     registration.consumerTag = reply.consumerTag;
+    registration.monitor.markActive("consumer-registered");
   }
 
-  private markChannelClosed(channel: ConfirmChannel): void {
+  private markChannelClosed(channel: ConfirmChannel, reason: string): void {
     if (this.channel !== channel) {
       return;
     }
@@ -384,6 +423,7 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
 
     for (const registration of this.consumers.values()) {
       registration.consumerTag = undefined;
+      registration.monitor.markChannelDropped(reason);
     }
 
     this.recoverConsumersAfterDisconnect();
@@ -399,7 +439,7 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
     }
 
     void this.activateConsumer(stage, registration, channel).catch(() => {
-      this.markChannelClosed(channel);
+      this.markChannelClosed(channel, "consumer-reactivation-failed");
     });
   }
 

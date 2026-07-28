@@ -40,7 +40,7 @@
   },
   "dependencies": {
     "@ramideltoro/nutsnews-worker-contracts": "0.4.0",
-    "@ramideltoro/nutsnews-worker-runtime": "0.4.0",
+    "@ramideltoro/nutsnews-worker-runtime": "0.5.0",
     "amqplib": "^2.0.1",
     "pg": "^8.22.0"
   },
