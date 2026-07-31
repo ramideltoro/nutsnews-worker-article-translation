@@ -17,17 +17,20 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7
         with:
           node-version: "24"
           cache: "npm"
           registry-url: "https://npm.pkg.github.com"
           scope: "@ramideltoro"
+
+      - name: Validate security baseline
+        run: python3 scripts/validate_security_baseline.py
 
       - name: Install dependencies
         env:
@@ -58,3 +61,13 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: docker build --pull=false --secret id=npm_token,env=NODE_AUTH_TOKEN -t nutsnews-worker-article-translation:${{ github.sha }} .
+
+      - name: Validate minimal runtime container
+        run: |
+          docker run --rm --entrypoint sh nutsnews-worker-article-translation:${{ github.sha }} -ec '
+            test ! -e /usr/local/bin/npm
+            test ! -e /usr/local/bin/npx
+            test ! -d /usr/local/lib/node_modules/npm
+            test ! -d /app/node_modules/typescript
+            test ! -d /app/node_modules/vitest
+          '
