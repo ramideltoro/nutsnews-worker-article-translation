@@ -9,12 +9,17 @@ import {
 import {
   describe,
   expect,
-  it
+  it,
+  vi
 } from "vitest";
 
 import { loadTranslationConfig } from "../src/config.js";
 import { createTranslationPrometheusMetricsSink } from "../src/metrics.js";
-import { createTranslationService } from "../src/service.js";
+import {
+  TRANSLATION_PROCESSING_DEADLINE_MS,
+  createTranslationService
+} from "../src/service.js";
+import { TRANSLATION_IDEMPOTENCY_LEASE_MS } from "../src/production.js";
 import {
   InMemoryTranslationStateStore,
   LocalTranslationBrokerOutbox,
@@ -51,7 +56,7 @@ describe("createTranslationService", () => {
     const metricsOutput = context.metrics.collect();
     const dependencyCounts = metricsOutput
       .split("\n")
-      .filter((line) => line.startsWith("nutsnews_worker_dependency_duration_ms_count{"));
+      .filter((line) => line.startsWith("nutsnews_worker_dependency_duration_seconds_count{"));
     expect(dependencyCounts).toHaveLength(1);
     expect(dependencyCounts[0]).toMatch(/ 1$/u);
 
@@ -141,6 +146,31 @@ describe("createTranslationService", () => {
     expect(context.service.isStarted).toBe(false);
   });
 
+  it("fails closed before the production idempotency lease can expire", async () => {
+    vi.useFakeTimers();
+    const context = createServiceContext();
+    context.workHandler.handleGate = new Promise<never>(() => undefined);
+
+    try {
+      expect(TRANSLATION_PROCESSING_DEADLINE_MS).toBeLessThan(
+        TRANSLATION_IDEMPOTENCY_LEASE_MS
+      );
+      await context.service.start();
+      const delivery = context.broker.deliverTranslation();
+      await Promise.resolve();
+
+      await vi.advanceTimersByTimeAsync(TRANSLATION_PROCESSING_DEADLINE_MS);
+      await expect(delivery).resolves.toMatchObject({
+        action: "retry",
+        reason: "handler-error"
+      });
+      expect(context.workHandler.handled).toHaveLength(0);
+      await context.service.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("keeps liveness independent from AI endpoint readiness", async () => {
     const context = createServiceContext();
 
@@ -199,6 +229,7 @@ function createServiceContext() {
       environment: config.environment,
       host: config.host
     },
+    expectedActive: !config.shadowMode,
     allowedLanguages: config.languagePolicy.targetLanguages
   });
   const service = createTranslationService({

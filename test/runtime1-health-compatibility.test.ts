@@ -1,54 +1,25 @@
 import {
   describe,
   expect,
-  it,
-  vi
+  it
 } from "vitest";
-
-const runtime1Delegate = vi.hoisted(() => ({
-  healthEvents: 0
-}));
-
-vi.mock("@ramideltoro/nutsnews-worker-runtime", () => ({
-  createPrometheusRuntimeTelemetrySink: () => ({
-    allowedLabels: [],
-    emit(event: { readonly name: string }): Promise<void> {
-      if (event.name === "runtime.health.evaluated") {
-        runtime1Delegate.healthEvents += 1;
-      }
-
-      return Promise.resolve();
-    },
-    collect(): string {
-      if (runtime1Delegate.healthEvents === 0) {
-        return "";
-      }
-
-      return [
-        "# HELP nutsnews_worker_health_probe Runtime 1 worker health status.",
-        "# TYPE nutsnews_worker_health_probe gauge",
-        'nutsnews_worker_health_probe{environment="test",host="test",outcome="ok",probe="readiness",service="translation",version="1.0.0"} 1',
-        ""
-      ].join("\n");
-    },
-    setInFlight(): void {},
-    setShutdownDraining(): void {}
-  })
-}));
 
 import { createTranslationPrometheusMetricsSink } from "../src/metrics.js";
 
-describe("Runtime 1 health metric compatibility", () => {
-  it("keeps one service-owned health-probe family", async () => {
-    runtime1Delegate.healthEvents = 0;
+describe("Runtime 1 metric ownership", () => {
+  it("exports Runtime-owned health, activity, consumer, and freshness families exactly once", async () => {
     const metrics = createTranslationPrometheusMetricsSink({
       identity: {
         service: "nutsnews-worker-article-translation",
         version: "0.1.0",
         environment: "test",
         host: "translation-test"
-      }
+      },
+      expectedActive: true
     });
+
+    expect(sampleValue(metrics.collect(), "nutsnews_worker_expected_active")).toBe(1);
+    expect(sampleValue(metrics.collect(), "nutsnews_worker_last_success_timestamp_seconds")).toBe(0);
 
     await metrics.emit({
       name: "runtime.health.evaluated",
@@ -57,19 +28,81 @@ describe("Runtime 1 health metric compatibility", () => {
       stage: "translation",
       outcome: "ok",
       attributes: {
-        probe: "readiness"
+        probe: "liveness",
+        checks: [
+          {
+            name: "process",
+            status: "ok",
+            durationMs: 4
+          }
+        ]
       }
+    });
+    await metrics.emit({
+      name: "runtime.broker.consumer_state_changed",
+      level: "info",
+      at: "2026-08-01T00:00:01.000Z",
+      stage: "translation",
+      queue: "nutsnews.worker.translation.v1",
+      outcome: "active",
+      attributes: {
+        activeConsumers: 1
+      }
+    });
+    await metrics.emit({
+      name: "runtime.message.accepted",
+      level: "info",
+      at: "2026-08-01T00:00:02.000Z",
+      stage: "translation",
+      queue: "nutsnews.worker.translation.v1",
+      outcome: "success",
+      durationMs: 25
     });
 
     const output = metrics.collect();
-    const healthSamples = output
-      .split("\n")
-      .filter((line) => line.startsWith("nutsnews_worker_health_probe{"));
 
-    expect(runtime1Delegate.healthEvents).toBe(0);
-    expect(output.match(/^# HELP nutsnews_worker_health_probe /gmu)).toHaveLength(1);
-    expect(output.match(/^# TYPE nutsnews_worker_health_probe gauge$/gmu)).toHaveLength(1);
-    expect(healthSamples).toHaveLength(9);
-    expect(new Set(healthSamples.map((line) => line.slice(0, line.lastIndexOf(" "))))).toHaveLength(9);
+    expectMetricDeclarationOnce(output, "nutsnews_worker_expected_active", "gauge");
+    expectMetricDeclarationOnce(output, "nutsnews_worker_last_success_timestamp_seconds", "gauge");
+    expectMetricDeclarationOnce(output, "nutsnews_worker_consumers", "gauge");
+    expectMetricDeclarationOnce(output, "nutsnews_worker_health_probe", "gauge");
+    expectMetricDeclarationOnce(output, "nutsnews_worker_health_check", "gauge");
+    expectMetricDeclarationOnce(output, "nutsnews_worker_health_check_duration_seconds", "histogram");
+    expect(output.split("\n").filter((line) => line.startsWith("nutsnews_worker_health_probe{"))).toHaveLength(3);
+    expect(sampleValue(output, "nutsnews_worker_consumers", {
+      queue: "nutsnews.worker.translation.v1"
+    })).toBe(1);
+    expect(sampleValue(output, "nutsnews_worker_health_probe", {
+      outcome: "ok",
+      probe: "liveness"
+    })).toBe(1);
+    expect(sampleValue(output, "nutsnews_worker_health_check", {
+      check: "process",
+      outcome: "ok",
+      probe: "liveness"
+    })).toBe(1);
+    expect(sampleValue(output, "nutsnews_worker_last_success_timestamp_seconds")).toBe(
+      Date.parse("2026-08-01T00:00:02.000Z") / 1_000
+    );
+    expect(output).not.toContain("nutsnews_worker_consumer_active");
   });
 });
+
+function expectMetricDeclarationOnce(output: string, metric: string, type: string): void {
+  expect(output.match(new RegExp(`^# HELP ${metric} `, "gmu"))).toHaveLength(1);
+  expect(output.match(new RegExp(`^# TYPE ${metric} ${type}$`, "gmu"))).toHaveLength(1);
+}
+
+function sampleValue(
+  output: string,
+  metric: string,
+  labels: Readonly<Record<string, string>> = {}
+): number {
+  const matches = output
+    .split("\n")
+    .filter((line) => line.startsWith(`${metric}{`))
+    .filter((line) => Object.entries(labels).every(([name, value]) => line.includes(`${name}="${value}"`)));
+
+  expect(matches).toHaveLength(1);
+
+  return Number(matches[0]?.split(" ").at(-1));
+}

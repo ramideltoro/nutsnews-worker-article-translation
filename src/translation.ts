@@ -93,7 +93,7 @@ export function createArticleTranslationWorkHandler(options: ArticleTranslationW
 
   return {
     name: "article-translation-work-handler",
-    handle: (context, tools) => handleTranslation(context, tools, safeOptions)
+    handle: (context, tools, signal) => handleTranslation(context, tools, safeOptions, signal)
   };
 }
 
@@ -143,8 +143,10 @@ export async function publishTranslationBacklogRecoveryTask(
 async function handleTranslation(
   context: RuntimeMessageContext,
   tools: TranslationWorkTools,
-  options: ArticleTranslationWorkHandlerOptions
+  options: ArticleTranslationWorkHandlerOptions,
+  signal: AbortSignal
 ): Promise<RuntimeHandlerResult> {
+  signal.throwIfAborted();
   let input: TranslationTaskInput;
 
   try {
@@ -157,7 +159,9 @@ async function handleTranslation(
   }
 
   const policy = await options.dependencies.languagePolicy.getPolicy();
+  signal.throwIfAborted();
   const prompt = await options.dependencies.promptRegistry.getPrompt(options.config.qwen.promptId);
+  signal.throwIfAborted();
   const requiredLanguages = policy.requiredLanguageCodes
     .filter((language) => input.targetLanguages.includes(language))
     .filter((language) => !input.existingLanguageCodes.includes(language));
@@ -166,7 +170,9 @@ async function handleTranslation(
   const summaryRefs: NonNullable<TranslationStoredLanguageResult["summaryRef"]>[] = [];
 
   for (const targetLanguage of requiredLanguages) {
+    signal.throwIfAborted();
     const existing = await tools.withTransaction((transaction) => options.dependencies.stateStore.findLanguageResult(languageKey(input, targetLanguage, prompt, options.config), transaction));
+    signal.throwIfAborted();
 
     if (existing?.status === "success") {
       completedLanguageCodes.push(targetLanguage);
@@ -176,19 +182,32 @@ async function handleTranslation(
       }
 
       await publishPersistenceIfNeeded(context, input, existing, tools, options);
+      signal.throwIfAborted();
       await emitLanguageTelemetry(options, existing, true);
+      signal.throwIfAborted();
       continue;
     }
 
-    const outcome = await translateLanguage(context, input, targetLanguage, prompt, policy, options);
+    const outcome = await translateLanguage(
+      context,
+      input,
+      targetLanguage,
+      prompt,
+      policy,
+      options,
+      signal
+    );
+    signal.throwIfAborted();
 
     if (outcome.status === "retry") {
       return outcome.result;
     }
 
     const recorded = await tools.withTransaction((transaction) => options.dependencies.stateStore.recordLanguageResult(outcome.result, transaction));
+    signal.throwIfAborted();
 
     await emitLanguageTelemetry(options, recorded, false);
+    signal.throwIfAborted();
 
     if (recorded.status === "success") {
       completedLanguageCodes.push(targetLanguage);
@@ -198,12 +217,14 @@ async function handleTranslation(
       }
 
       await publishPersistenceIfNeeded(context, input, recorded, tools, options);
+      signal.throwIfAborted();
     } else {
       failedLanguageCodes.push(targetLanguage);
     }
   }
 
   await publishTranslationStatus(context, input, requiredLanguages, completedLanguageCodes, failedLanguageCodes, summaryRefs, tools, options);
+  signal.throwIfAborted();
 
   return {
     status: "ok"
@@ -216,16 +237,21 @@ async function translateLanguage(
   targetLanguage: string,
   prompt: TranslationPrompt,
   policy: TranslationLanguagePolicySnapshot,
-  options: ArticleTranslationWorkHandlerOptions
+  options: ArticleTranslationWorkHandlerOptions,
+  signal: AbortSignal
 ): Promise<TranslationOutcome> {
+  signal.throwIfAborted();
   void policy;
   const startedAtMs = options.dependencies.clock.now().getTime();
-  const request = qwenRequest(input, targetLanguage, prompt, options.config);
+  const request = qwenRequest(input, targetLanguage, prompt, options.config, signal);
   let raw: unknown;
 
   try {
     raw = await options.dependencies.qwenClient.translate(request);
+    signal.throwIfAborted();
   } catch (error: unknown) {
+    signal.throwIfAborted();
+
     if (isApprovedTransientQwenError(error)) {
       await emitLanguageRetryTelemetry(options, targetLanguage, prompt, error, elapsedMs(options, startedAtMs));
 
@@ -270,6 +296,7 @@ async function translateLanguage(
     minSummaryChars: options.config.quality.minSummaryChars,
     maxSummaryChars: options.config.quality.maxSummaryChars
   });
+  signal.throwIfAborted();
 
   if (!quality.ok) {
     return qualityFailureOutcome(context, input, targetLanguage, prompt, options, quality.reason, validation.value.qualityScore, validation.value.latencyMs, quality.retryable);
@@ -327,13 +354,15 @@ function qwenRequest(
   input: TranslationTaskInput,
   targetLanguage: string,
   prompt: TranslationPrompt,
-  config: TranslationConfig
+  config: TranslationConfig,
+  signal: AbortSignal
 ): TranslationQwenRequest {
   return {
     model: config.qwen.model,
     prompt,
     timeoutMs: config.qwen.totalTimeoutMs,
     maxInputBytes: config.qwen.maxInputBytes,
+    signal,
     deterministic: {
       temperature: 0,
       topP: 1

@@ -72,9 +72,8 @@ export {
 } from "./reconciliation.js";
 export {
   TRANSLATION_DURATION_BUCKETS_SECONDS,
+  TRANSLATION_RUNTIME_HEALTH_CHECKS,
   createTranslationPrometheusMetricsSink,
-  type TranslationHealthOutcome,
-  type TranslationHealthProbe,
   type TranslationPrometheusMetricsSink,
   type TranslationPrometheusMetricsSinkOptions,
   type TranslationRuntimeMetricsSink
@@ -88,10 +87,13 @@ export {
   PostgresTranslationTransactionRunner,
   StaticTranslationLanguagePolicy,
   StaticTranslationPromptRegistry,
+  TRANSLATION_IDEMPOTENCY_LEASE_MS,
+  TRANSLATION_IDEMPOTENCY_RENEWAL_INTERVAL_MS,
   createProductionTranslationDependencies,
   type ProductionTranslationDependencies
 } from "./production.js";
 export {
+  TRANSLATION_PROCESSING_DEADLINE_MS,
   createTranslationService,
   type TranslationService
 } from "./service.js";
@@ -134,6 +136,18 @@ export function createTranslationApplication(
   config = loadTranslationConfig(),
   options: TranslationApplicationOptions = {}
 ): TranslationApplication {
+  if (config.environment === "production" && config.dependencyMode !== "production") {
+    throw new Error(
+      "Production translation applications require the production dependency adapter mode."
+    );
+  }
+
+  if (config.dependencyMode === "production" && options.dependencies !== undefined) {
+    throw new Error(
+      "Production translation dependencies are fixed to the PostgreSQL/RabbitMQ adapter set and cannot be overridden."
+    );
+  }
+
   const identity = {
     service: config.serviceName,
     version: config.serviceVersion,
@@ -156,6 +170,7 @@ export function createTranslationApplication(
   const metrics = config.metricsEnabled
     ? createTranslationPrometheusMetricsSink({
         identity,
+        expectedActive: !config.shadowMode,
         allowedLanguages: config.languagePolicy.targetLanguages
       })
     : undefined;
@@ -361,20 +376,28 @@ function hasReconciliationToken(
   return typeof candidate.reconciliationToken === "string" && candidate.reconciliationToken.length > 0;
 }
 
-export const SUPPORTED_RUNTIME_PACKAGE_VERSION = "0.5.0";
+export const SUPPORTED_CONTRACT_PACKAGE_VERSION = "1.0.0";
+export const SUPPORTED_RUNTIME_PACKAGE_VERSION = "1.0.0";
 
 function assertPackageCompatibility(): void {
   const contracts = getContractPackageMetadata();
   const runtime = getRuntimePackageMetadata();
   const contractsVersion: string = contracts.packageVersion;
   const runtimeVersion: string = runtime.packageVersion;
+  const runtimeContractsVersion: string = runtime.contractsPackageVersion;
 
-  if (contractsVersion !== "0.4.0") {
+  if (contractsVersion !== SUPPORTED_CONTRACT_PACKAGE_VERSION) {
     throw new Error(`Unsupported contracts package version ${contractsVersion}.`);
   }
 
   if (runtimeVersion !== SUPPORTED_RUNTIME_PACKAGE_VERSION) {
     throw new Error(`Unsupported runtime package version ${runtimeVersion}.`);
+  }
+
+  if (runtimeContractsVersion !== SUPPORTED_CONTRACT_PACKAGE_VERSION) {
+    throw new Error(
+      `Unsupported runtime contracts package version ${runtimeContractsVersion}.`
+    );
   }
 }
 

@@ -44,6 +44,7 @@ describe("translation HTTP endpoints", () => {
         environment: config.environment,
         host: config.host
       },
+      expectedActive: !config.shadowMode,
       allowedLanguages: config.languagePolicy.targetLanguages
     });
     const dependencies = createLocalTranslationDependencies();
@@ -72,14 +73,24 @@ describe("translation HTTP endpoints", () => {
     expect(metricsResponse.status).toBe(200);
     expect(metricsResponse.headers.get("content-type")).toContain("text/plain; version=0.0.4");
     const metricsBody = await metricsResponse.text();
-    expect(metricsBody).toContain("nutsnews_worker_dependency_duration_ms");
+    expect(metricsBody).toContain("nutsnews_worker_dependency_duration_seconds_bucket");
+    expect(metricsBody).not.toContain("nutsnews_worker_dependency_duration_ms");
     expect(metricsBody).toContain("nutsnews_worker_uplift_stage_events_total");
     expect(metricsBody).toContain('nutsnews_worker_uplift_stage_latency_seconds_bucket{environment="local",service="translation",le="30"} 1');
-    expect(metricsBody).toContain('nutsnews_worker_expected_active{environment="local",service="translation"} 0');
-    expect(metricsBody).toContain('nutsnews_worker_consumer_active{environment="local",queue="nutsnews.worker.translation.v1",service="translation"} 1');
-    expect(metricsBody).toContain('nutsnews_worker_health_probe{environment="local",outcome="ok",probe="liveness",service="translation"} 1');
-    expect(metricsBody).toContain('nutsnews_worker_health_probe{environment="local",outcome="ok",probe="startup",service="translation"} 1');
-    expect(metricsBody).toContain('nutsnews_worker_health_probe{environment="local",outcome="ok",probe="readiness",service="translation"} 1');
+    expect(metricsBody).toContain('nutsnews_worker_expected_active{environment="local",service="nutsnews-worker-article-translation"} 0');
+    expect(metricsBody.split("\n").some((line) => line.startsWith("nutsnews_worker_consumers{")
+      && line.includes('queue="nutsnews.worker.translation.v1"')
+      && line.endsWith(" 1"))).toBe(true);
+    for (const probe of [
+      "liveness",
+      "startup",
+      "readiness"
+    ]) {
+      expect(metricsBody.split("\n").some((line) => line.startsWith("nutsnews_worker_health_probe{")
+        && line.includes('outcome="ok"')
+        && line.includes(`probe="${probe}"`)
+        && line.endsWith(" 1"))).toBe(true);
+    }
     expect(metricsBody).not.toContain("article-001");
     expect(metricsBody).not.toContain("approval:translation:");
 

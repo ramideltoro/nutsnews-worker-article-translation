@@ -59,6 +59,7 @@ describe("createTranslationApplication", () => {
       expect(metrics.status).toBe(200);
       const metricsBody = await metrics.text();
       expect(metricsBody).toContain("nutsnews_worker_health_probe");
+      expect(metricsBody).toContain('nutsnews_worker_expected_active{environment="test",service="nutsnews-worker-article-translation"} 0');
       expect(metricsBody.split("\n").some((line) => line.includes('probe="startup"') && line.includes('outcome="unhealthy"') && line.endsWith(" 1"))).toBe(true);
 
       connectRelease.resolve();
@@ -139,6 +140,32 @@ describe("createTranslationApplication", () => {
     connectRelease.resolve();
     await expect(starting).rejects.toThrow("startup was interrupted by shutdown");
     await expect(application.stop()).resolves.toBeUndefined();
+  });
+
+  it("rejects dependency injection in production adapter mode", () => {
+    const config = loadTranslationConfig({
+      NUTSNEWS_ENVIRONMENT: "production",
+      NUTSNEWS_TRANSLATION_DEPENDENCY_MODE: "production",
+      NUTSNEWS_TRANSLATION_BUILD_REVISION: "0123456789abcdef0123456789abcdef01234567",
+      NUTSNEWS_TRANSLATION_DATABASE_URL: "postgres://translation:secret@example.invalid/nutsnews",
+      NUTSNEWS_TRANSLATION_RABBITMQ_URL: "amqp://translation:secret@example.invalid",
+      NUTSNEWS_TRANSLATION_QWEN_BASE_URL: "https://qwen.example.invalid",
+      NUTSNEWS_TRANSLATION_QWEN_API_KEY: "not-a-real-key",
+      NUTSNEWS_TRANSLATION_TELEMETRY_LOGS: "silent"
+    });
+
+    expect(() => createTranslationApplication(config, {
+      dependencies: createLocalTranslationDependencies()
+    })).toThrow("Production translation dependencies are fixed");
+  });
+
+  it("rejects a hand-constructed production config that bypasses the loader adapter guard", () => {
+    const localConfig = applicationConfig();
+
+    expect(() => createTranslationApplication({
+      ...localConfig,
+      environment: "production"
+    })).toThrow("Production translation applications require the production dependency adapter mode");
   });
 });
 

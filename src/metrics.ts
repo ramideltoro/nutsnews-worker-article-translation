@@ -1,5 +1,6 @@
 import {
   createPrometheusRuntimeTelemetrySink,
+  type PrometheusRuntimeTelemetrySink,
   type PrometheusRuntimeTelemetrySinkOptions,
   type RuntimeServiceIdentity,
   type RuntimeTelemetryEvent
@@ -28,18 +29,16 @@ interface HistogramState {
   sum: number;
 }
 
-export interface TranslationPrometheusMetricsSinkOptions extends Omit<PrometheusRuntimeTelemetrySinkOptions, "identity"> {
+export interface TranslationPrometheusMetricsSinkOptions extends Omit<
+  PrometheusRuntimeTelemetrySinkOptions,
+  "cardinality" | "expectedActive" | "identity"
+> {
   readonly identity: TranslationRuntimeMetricIdentity;
+  readonly expectedActive: boolean;
   readonly allowedLanguages?: readonly string[];
 }
 
-export interface TranslationRuntimeMetricsSink {
-  readonly allowedLabels: readonly string[];
-  emit(event: RuntimeTelemetryEvent): void | Promise<void>;
-  collect(): string;
-  setInFlight(queue: string, value: number): void;
-  setShutdownDraining(draining: boolean): void;
-}
+export type TranslationRuntimeMetricsSink = PrometheusRuntimeTelemetrySink;
 
 export interface TranslationPrometheusMetricsSink extends TranslationRuntimeMetricsSink {
   readonly stageMetricLabels: readonly [
@@ -55,12 +54,7 @@ export interface TranslationPrometheusMetricsSink extends TranslationRuntimeMetr
     "language",
     "provider"
   ];
-  setConsumerActive(activeConsumers: number): void;
-  setHealthProbe(probe: TranslationHealthProbe, outcome: TranslationHealthOutcome): void;
 }
-
-export type TranslationHealthProbe = "liveness" | "startup" | "readiness";
-export type TranslationHealthOutcome = "ok" | "degraded" | "unhealthy";
 
 const TRANSLATION_STAGE = "translation";
 const TRANSLATION_QUEUE = "nutsnews.worker.translation.v1";
@@ -98,18 +92,29 @@ const TRANSLATION_STAGE_OUTCOMES = [
   "dlq",
   "failure"
 ] as const;
-const HEALTH_PROBES = [
-  "liveness",
-  "startup",
-  "readiness"
-] as const satisfies readonly TranslationHealthProbe[];
-const HEALTH_OUTCOMES = [
-  "ok",
-  "degraded",
-  "unhealthy"
-] as const satisfies readonly TranslationHealthOutcome[];
+const RUNTIME_DEPENDENCIES = [
+  "article-translation",
+  "article-translation-work-handler",
+  "translation-shell"
+] as const;
+export const TRANSLATION_RUNTIME_HEALTH_CHECKS = [
+  "process",
+  "service-started",
+  "broker-lifecycle",
+  "rabbitmq-consumer",
+  "translation-state",
+  "database-transactions",
+  "broker-outbox",
+  "qwen-client",
+  "prompt-registry",
+  "language-policy",
+  "quality-validator",
+  "shadow-mode"
+] as const;
 export const TRANSLATION_DURATION_BUCKETS_SECONDS = [
+  0.005,
   0.01,
+  0.025,
   0.05,
   0.1,
   0.25,
@@ -127,7 +132,15 @@ export const TRANSLATION_DURATION_BUCKETS_SECONDS = [
 export function createTranslationPrometheusMetricsSink(
   options: TranslationPrometheusMetricsSinkOptions
 ): TranslationPrometheusMetricsSink {
-  const runtimeMetrics = createPrometheusRuntimeTelemetrySink(options);
+  const runtimeMetrics = createPrometheusRuntimeTelemetrySink({
+    identity: options.identity,
+    defaultQueue: options.defaultQueue ?? TRANSLATION_QUEUE,
+    cardinality: {
+      dependencies: RUNTIME_DEPENDENCIES,
+      healthChecks: TRANSLATION_RUNTIME_HEALTH_CHECKS
+    },
+    expectedActive: options.expectedActive
+  });
   const counters = new Map<string, Map<string, number>>();
   const histograms = new Map<string, Map<string, HistogramState>>();
   const identity = {
@@ -138,21 +151,10 @@ export function createTranslationPrometheusMetricsSink(
     (options.allowedLanguages ?? DEFAULT_LANGUAGES)
       .filter((language) => SUPPORTED_LANGUAGES.has(language))
   );
-  const health = new Map<TranslationHealthProbe, TranslationHealthOutcome>([
-    [
-      "liveness",
-      "ok"
-    ],
-    [
-      "startup",
-      "unhealthy"
-    ],
-    [
-      "readiness",
-      "unhealthy"
-    ]
-  ]);
-  let consumerActive = 0;
+  let lastSuccessTimestampSeconds = 0;
+
+  runtimeMetrics.setLastSuccessTimestamp(lastSuccessTimestampSeconds);
+  runtimeMetrics.setInFlight(options.defaultQueue ?? TRANSLATION_QUEUE, 0);
 
   return {
     get allowedLabels() {
@@ -172,17 +174,24 @@ export function createTranslationPrometheusMetricsSink(
       "provider"
     ],
     async emit(event: RuntimeTelemetryEvent): Promise<void> {
-      // Runtime 0.5 treats a duration-less dependency event as a zero-valued
-      // summary observation. Forward only measured dependency calls so the
-      // retained generic metrics do not manufacture latency samples.
-      if (shouldForwardToRuntimeMetrics(event)) {
-        await emitTelemetryBestEffort(runtimeMetrics, event);
+      await emitTelemetryBestEffort(runtimeMetrics, event);
+      const consumerFailure = consumerFailureHealthEvent(event);
+
+      if (consumerFailure !== undefined) {
+        await emitTelemetryBestEffort(runtimeMetrics, consumerFailure);
       }
-      runTelemetryBestEffort(() => recordHealthEvent(health, event));
+
       runTelemetryBestEffort(() => {
-        consumerActive = consumerActiveFromEvent(event) ?? consumerActive;
+        const eventTimestamp = lastSuccessTimestampFromEvent(event);
+
+        if (eventTimestamp !== undefined) {
+          lastSuccessTimestampSeconds = setMonotonicLastSuccessTimestamp(
+            runtimeMetrics,
+            lastSuccessTimestampSeconds,
+            eventTimestamp
+          );
+        }
       });
-      runTelemetryBestEffort(() => recordConsumerReadinessEvent(health, event));
       runTelemetryBestEffort(() => observeStageEvent(event, identity, counters, histograms));
       runTelemetryBestEffort(() => observeTranslationLanguageEvent(event, identity, allowedLanguages, counters, histograms));
     },
@@ -193,7 +202,7 @@ export function createTranslationPrometheusMetricsSink(
         runtimeOutput = runtimeMetrics.collect();
       });
 
-      return `${runtimeOutput}${collectCompatibilityIdentityMetrics(options, runtimeOutput)}${collectExpectedActiveMetric(identity)}${collectConsumerActiveMetric(identity, consumerActive)}${collectHealthProbeMetrics(identity, health)}${collectCustomMetrics(counters, histograms)}`;
+      return `${runtimeOutput}${collectCustomMetrics(counters, histograms)}`;
     },
     setInFlight(queue, value): void {
       runTelemetryBestEffort(() => runtimeMetrics.setInFlight(queue, value));
@@ -201,153 +210,17 @@ export function createTranslationPrometheusMetricsSink(
     setShutdownDraining(draining): void {
       runTelemetryBestEffort(() => runtimeMetrics.setShutdownDraining(draining));
     },
-    setConsumerActive(activeConsumers): void {
-      consumerActive = Math.max(0, Math.floor(activeConsumers));
+    setExpectedActive(expected): void {
+      runTelemetryBestEffort(() => runtimeMetrics.setExpectedActive(expected));
     },
-    setHealthProbe(probe, outcome): void {
-      health.set(probe, outcome);
+    setLastSuccessTimestamp(timestampSeconds): void {
+      lastSuccessTimestampSeconds = setMonotonicLastSuccessTimestamp(
+        runtimeMetrics,
+        lastSuccessTimestampSeconds,
+        timestampSeconds
+      );
     }
   };
-}
-
-function collectCompatibilityIdentityMetrics(
-  options: TranslationPrometheusMetricsSinkOptions,
-  runtimeOutput: string
-): string {
-  const identity = options.identity;
-  const environment = boundedLabel(identity.environment);
-  const service = boundedLabel(identity.service);
-  const lines: string[] = [];
-
-  if (!hasMetricFamily(runtimeOutput, "nutsnews_worker_build_info")) {
-    lines.push(
-      "# HELP nutsnews_worker_build_info Immutable worker build identity.",
-      "# TYPE nutsnews_worker_build_info gauge",
-      `nutsnews_worker_build_info${labelsKey({
-        environment,
-        service,
-        version: boundedLabel(identity.version),
-        revision: boundedLabel(identity.revision ?? "unknown")
-      })} 1`
-    );
-  }
-
-  if (!hasMetricFamily(runtimeOutput, "nutsnews_worker_deployment_info")) {
-    lines.push(
-      "# HELP nutsnews_worker_deployment_info Worker deployment ownership and dependency adapter identity.",
-      "# TYPE nutsnews_worker_deployment_info gauge",
-      `nutsnews_worker_deployment_info${labelsKey({
-        environment,
-        service,
-        deployment: boundedLabel(identity.deployment ?? "unknown"),
-        adapter: boundedLabel(identity.adapter ?? "unknown")
-      })} 1`
-    );
-  }
-
-  return lines.length === 0 ? "" : `${lines.join("\n")}\n`;
-}
-
-function hasMetricFamily(output: string, metric: string): boolean {
-  return output.split("\n").some((line) => line.startsWith(`# HELP ${metric} `)
-    || line.startsWith(`${metric}{`)
-    || line.startsWith(`${metric} `));
-}
-
-function collectExpectedActiveMetric(identity: TranslationMetricIdentity): string {
-  return [
-    "# HELP nutsnews_worker_expected_active Whether this worker deployment is expected to own active production work.",
-    "# TYPE nutsnews_worker_expected_active gauge",
-    `nutsnews_worker_expected_active${labelsKey({
-      environment: boundedLabel(identity.environment),
-      service: TRANSLATION_STAGE
-    })} 0`
-  ].join("\n").concat("\n");
-}
-
-function collectConsumerActiveMetric(
-  identity: TranslationMetricIdentity,
-  activeConsumers: number
-): string {
-  return [
-    "# HELP nutsnews_worker_consumer_active Active translation main-queue consumers reported by the service.",
-    "# TYPE nutsnews_worker_consumer_active gauge",
-    `nutsnews_worker_consumer_active${labelsKey({
-      environment: boundedLabel(identity.environment),
-      service: TRANSLATION_STAGE,
-      queue: TRANSLATION_QUEUE
-    })} ${formatMetricNumber(activeConsumers)}`
-  ].join("\n").concat("\n");
-}
-
-function collectHealthProbeMetrics(
-  identity: TranslationMetricIdentity,
-  health: ReadonlyMap<TranslationHealthProbe, TranslationHealthOutcome>
-): string {
-  const lines = [
-    "# HELP nutsnews_worker_health_probe Worker health status by distinct bounded probe and outcome.",
-    "# TYPE nutsnews_worker_health_probe gauge"
-  ];
-
-  for (const probe of HEALTH_PROBES) {
-    const current = health.get(probe) ?? "unhealthy";
-
-    for (const outcome of HEALTH_OUTCOMES) {
-      lines.push(`nutsnews_worker_health_probe${labelsKey({
-        environment: boundedLabel(identity.environment),
-        service: TRANSLATION_STAGE,
-        probe,
-        outcome
-      })} ${outcome === current ? "1" : "0"}`);
-    }
-  }
-
-  return `${lines.join("\n")}\n`;
-}
-
-function recordHealthEvent(
-  health: Map<TranslationHealthProbe, TranslationHealthOutcome>,
-  event: RuntimeTelemetryEvent
-): void {
-  if (event.name !== "runtime.health.evaluated") {
-    return;
-  }
-
-  const probe = event.attributes?.probe;
-  const outcome = event.outcome;
-
-  if (isHealthProbe(probe) && isHealthOutcome(outcome)) {
-    health.set(probe, outcome);
-  }
-}
-
-function consumerActiveFromEvent(event: RuntimeTelemetryEvent): number | undefined {
-  if (
-    event.name !== "runtime.broker.consumer_state_changed"
-    || event.stage !== TRANSLATION_STAGE
-    || event.queue !== TRANSLATION_QUEUE
-  ) {
-    return undefined;
-  }
-
-  const activeConsumers = event.attributes?.activeConsumers;
-
-  if (typeof activeConsumers === "number" && Number.isFinite(activeConsumers)) {
-    return Math.max(0, Math.floor(activeConsumers));
-  }
-
-  return event.outcome === "active" ? 1 : 0;
-}
-
-function recordConsumerReadinessEvent(
-  health: Map<TranslationHealthProbe, TranslationHealthOutcome>,
-  event: RuntimeTelemetryEvent
-): void {
-  const activeConsumers = consumerActiveFromEvent(event);
-
-  if (activeConsumers === 0) {
-    health.set("readiness", "unhealthy");
-  }
 }
 
 function observeStageEvent(
@@ -664,47 +537,85 @@ function secondsFromMilliseconds(value: unknown): number | undefined {
   return milliseconds === undefined ? undefined : milliseconds / 1_000;
 }
 
-function measuredDurationMs(event: RuntimeTelemetryEvent): number | undefined {
-  return finiteNonNegativeNumber(event.durationMs) ?? numberAttribute(event, "durationMs");
-}
-
-function shouldForwardToRuntimeMetrics(event: RuntimeTelemetryEvent): boolean {
-  // This service owns the bounded, probe-specific health family below. Runtime
-  // 1.x emits the same family for runtime.health.evaluated, so forwarding that
-  // event would duplicate HELP/TYPE metadata and samples after the runtime
-  // upgrade.
-  if (event.name === "runtime.health.evaluated") {
-    return false;
+function lastSuccessTimestampFromEvent(event: RuntimeTelemetryEvent): number | undefined {
+  if (event.stage !== TRANSLATION_STAGE || event.queue !== TRANSLATION_QUEUE) {
+    return undefined;
   }
 
-  if (event.name !== "runtime.dependency.observed") {
-    return true;
+  const isAccepted = event.name === "runtime.message.accepted";
+  const isAlreadyCompletedDuplicate = event.name === "runtime.message.duplicate"
+    && stringAttribute(event, "completedAt") !== undefined;
+
+  if (!isAccepted && !isAlreadyCompletedDuplicate) {
+    return undefined;
   }
 
-  const durationMs = measuredDurationMs(event);
+  const timestampSeconds = Date.parse(event.at) / 1_000;
 
-  if (durationMs === undefined) {
-    return false;
+  return Number.isFinite(timestampSeconds) && timestampSeconds >= 0
+    ? Math.floor(timestampSeconds)
+    : undefined;
+}
+
+function consumerFailureHealthEvent(event: RuntimeTelemetryEvent): RuntimeTelemetryEvent | undefined {
+  if (
+    event.name !== "runtime.broker.consumer_state_changed"
+    || event.stage !== TRANSLATION_STAGE
+    || event.queue !== TRANSLATION_QUEUE
+  ) {
+    return undefined;
   }
 
-  return durationMs > 0 || !isStartupDependencyEvent(event);
+  const activeConsumers = finiteNonNegativeNumber(event.attributes?.activeConsumers)
+    ?? (event.outcome === "active" ? 1 : 0);
+
+  if (activeConsumers > 0) {
+    return undefined;
+  }
+
+  return {
+    name: "runtime.health.evaluated",
+    level: "warn",
+    at: event.at,
+    stage: TRANSLATION_STAGE,
+    outcome: "unhealthy",
+    attributes: {
+      probe: "readiness",
+      status: "unhealthy",
+      checkCount: 1,
+      checks: [
+        {
+          name: "rabbitmq-consumer",
+          status: "unhealthy",
+          critical: true,
+          // Runtime requires the field structurally, while a transition is not
+          // a timed probe execution. A non-finite value updates only gauges.
+          durationMs: Number.NaN
+        }
+      ]
+    }
+  };
 }
 
-function isStartupDependencyEvent(event: RuntimeTelemetryEvent): boolean {
-  const dependency = stringAttribute(event, "dependency");
-  const eventName = stringAttribute(event, "event");
+function setMonotonicLastSuccessTimestamp(
+  runtimeMetrics: PrometheusRuntimeTelemetrySink,
+  previousTimestampSeconds: number,
+  timestampSeconds: number
+): number {
+  if (!Number.isFinite(timestampSeconds) || timestampSeconds < 0) {
+    runtimeMetrics.setLastSuccessTimestamp(timestampSeconds);
 
-  return dependency === "translation-shell"
-    || eventName === "translation.configuration"
-    || eventName === "translation.startup";
-}
+    return previousTimestampSeconds;
+  }
 
-function isHealthProbe(value: unknown): value is TranslationHealthProbe {
-  return typeof value === "string" && HEALTH_PROBES.some((probe) => probe === value);
-}
+  const nextTimestampSeconds = Math.max(
+    previousTimestampSeconds,
+    Math.floor(timestampSeconds)
+  );
 
-function isHealthOutcome(value: unknown): value is TranslationHealthOutcome {
-  return typeof value === "string" && HEALTH_OUTCOMES.some((outcome) => outcome === value);
+  runtimeMetrics.setLastSuccessTimestamp(nextTimestampSeconds);
+
+  return nextTimestampSeconds;
 }
 
 function boundedLabel(value: string): string {

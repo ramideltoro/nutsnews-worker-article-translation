@@ -29,6 +29,7 @@ import {
   type RuntimeBrokerTransport,
   type RuntimeClock,
   type RuntimeIdempotencyClaimContext,
+  type RuntimeIdempotencyClaimReleaseResult,
   type RuntimeIdempotencyClaimResult,
   type RuntimeIdempotencyCompletion,
   type RuntimeIdempotencyFailure,
@@ -86,7 +87,12 @@ const TRANSLATION_SCHEMA = "worker_uplift_translation";
 const DEFAULT_PROMPT_VERSION = "0.1.0";
 const DEFAULT_LANGUAGE_POLICY_VERSION = "0.1.0";
 const DEFAULT_CONFIRM_TIMEOUT_MS = WORKER_DELIVERY_BEHAVIOR.confirmTimeoutMs;
+const DEFAULT_BROKER_CONNECT_TIMEOUT_MS = 5_000;
+const DEFAULT_BROKER_DISPOSAL_TIMEOUT_MS = 1_000;
 const DEFAULT_DRAIN_TIMEOUT_MS = 30_000;
+export const TRANSLATION_IDEMPOTENCY_LEASE_MS = 300_000;
+export const TRANSLATION_IDEMPOTENCY_RENEWAL_INTERVAL_MS = 60_000;
+const TRANSLATION_PUBLISH_ABORT_SIGNAL = Symbol("translation-publish-abort-signal");
 
 export type ProductionTranslationDependencies = TranslationDependencies & {
   readonly reconciler: TranslationReconciler;
@@ -125,6 +131,18 @@ interface LocalAiUsage {
 
 type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 type RabbitMqConnect = (url: string) => Promise<ChannelModel>;
+type AbortableBrokerPublishCommand = BrokerPublishCommand & {
+  readonly [TRANSLATION_PUBLISH_ABORT_SIGNAL]?: AbortSignal;
+};
+
+export function withTranslationPublishSignal(
+  command: BrokerPublishCommand,
+  signal: AbortSignal
+): BrokerPublishCommand {
+  return Object.assign({}, command, {
+    [TRANSLATION_PUBLISH_ABORT_SIGNAL]: signal
+  });
+}
 
 export function createProductionTranslationDependencies(
   options: ProductionTranslationDependencyOptions
@@ -133,6 +151,9 @@ export function createProductionTranslationDependencies(
   const pool = new Pool({
     connectionString: requiredEnv(env, "NUTSNEWS_TRANSLATION_DATABASE_URL"),
     max: Math.max(2, options.config.concurrency + 1),
+    connectionTimeoutMillis: 5_000,
+    query_timeout: 30_000,
+    statement_timeout: 30_000,
     application_name: options.config.serviceName
   });
   const brokerTransport = new PayloadRabbitMqTransport({
@@ -176,6 +197,7 @@ export function createProductionTranslationDependencies(
     qualityValidator: new LocalTranslationQualityValidator(),
     workHandler: options.workHandler ?? new LocalTranslationWorkHandler(),
     async close(): Promise<void> {
+      stateStore.close();
       await brokerTransport.close();
       await pool.end();
     }
@@ -198,6 +220,8 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
   private closing = false;
   private reconnecting: Promise<void> | undefined;
   private reconnectRetry: ReturnType<typeof setTimeout> | undefined;
+  private channelSetup: Promise<ConfirmChannel> | undefined;
+  private channelSetupAbort: AbortController | undefined;
 
   constructor(options: {
     readonly url: string;
@@ -232,8 +256,11 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
   }
 
   async publish(command: BrokerPublishCommand): Promise<BrokerPublishReceipt> {
+    const signal = publishSignal(command);
+    signal?.throwIfAborted();
     const route = getWorkerRoute(command.envelope.route);
-    const channel = await this.ensureChannel();
+    const channel = await this.ensureChannel(signal);
+    signal?.throwIfAborted();
 
     await publishCarrierWithConfirm(channel, {
       carrier: {
@@ -242,7 +269,10 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
       },
       exchange: route.exchange,
       routingKey: route.routingKey,
-      confirmTimeoutMs: DEFAULT_CONFIRM_TIMEOUT_MS
+      confirmTimeoutMs: DEFAULT_CONFIRM_TIMEOUT_MS,
+      ...(signal === undefined ? {} : {
+        signal
+      })
     });
 
     return {
@@ -256,27 +286,50 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
   }
 
   async consume(stage: WorkerStage, handler: BrokerDeliveryHandler): Promise<BrokerConsumerHandle> {
-    const channel = await this.ensureChannel();
+    const setupSignal = AbortSignal.timeout(DEFAULT_BROKER_CONNECT_TIMEOUT_MS);
+    const channel = await this.ensureChannel(setupSignal);
+    const connection = this.connection;
     const existing = this.consumers.get(stage);
+    let registration: PayloadConsumerRegistration | undefined;
 
-    if (existing?.consumerTag !== undefined) {
-      existing.monitor.markClosed("consumer-replaced");
-      await channel.cancel(existing.consumerTag).catch(() => undefined);
-    }
+    try {
+      if (existing?.consumerTag !== undefined) {
+        await waitForAbortableResult(
+          channel.cancel(existing.consumerTag),
+          setupSignal,
+          () => undefined
+        );
+        existing.monitor.markClosed("consumer-replaced");
+      }
 
-    const registration: PayloadConsumerRegistration = {
-      handler,
-      consumerTag: undefined,
-      monitor: createBrokerConsumerMonitor({
-        stage,
-        clock: this.clock,
-        ...(this.telemetry === undefined ? {} : {
-          telemetry: this.telemetry
+      registration = {
+        handler,
+        consumerTag: undefined,
+        monitor: createBrokerConsumerMonitor({
+          stage,
+          clock: this.clock,
+          ...(this.telemetry === undefined ? {} : {
+            telemetry: this.telemetry
+          })
         })
-      })
-    };
-    this.consumers.set(stage, registration);
-    await this.activateConsumer(stage, registration, channel);
+      };
+      this.consumers.set(stage, registration);
+      await this.activateConsumer(stage, registration, channel, setupSignal);
+    } catch (error: unknown) {
+      if (registration !== undefined && this.consumers.get(stage) === registration) {
+        this.consumers.delete(stage);
+        registration.monitor.markClosed("consumer-activation-failed");
+      }
+
+      await this.discardChannelSetup(
+        connection,
+        channel,
+        "consumer-activation-failed",
+        setupSignal
+      );
+      this.recoverConsumersAfterDisconnect();
+      throw error;
+    }
 
     return {
       stage,
@@ -286,7 +339,11 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
         registered?.monitor.markClosed("consumer-handle-cancelled");
 
         if (registered?.consumerTag !== undefined && this.channel !== undefined) {
-          await this.channel.cancel(registered.consumerTag).catch(() => undefined);
+          const channel = this.channel;
+          const consumerTag = registered.consumerTag;
+          await settleBrokerOperationWithinBound(
+            () => channel.cancel(consumerTag)
+          );
         }
       }
     };
@@ -310,109 +367,252 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
   async close(): Promise<void> {
     this.closing = true;
     this.clearReconnectRetry();
+    const setup = this.channelSetup;
+    const setupAbort = this.channelSetupAbort;
     const channel = this.channel;
+    const connection = this.connection;
+    this.channelSetup = undefined;
+    this.channelSetupAbort = undefined;
+    this.channel = undefined;
+    this.connection = undefined;
+    setupAbort?.abort(new Error("RabbitMQ payload transport is closing."));
+    const cancellations: Promise<void>[] = [];
 
     if (channel !== undefined) {
       for (const registration of this.consumers.values()) {
         if (registration.consumerTag !== undefined) {
-          await channel.cancel(registration.consumerTag).catch(() => undefined);
+          const consumerTag = registration.consumerTag;
+          registration.consumerTag = undefined;
+          cancellations.push(settleBrokerOperationWithinBound(
+            () => channel.cancel(consumerTag)
+          ));
         }
         registration.monitor.markClosed("transport-closing");
       }
     }
 
     this.consumers.clear();
-    await this.drain().catch(() => undefined);
-
-    if (this.channel !== undefined) {
-      await this.channel.close().catch(() => undefined);
-      this.channel = undefined;
-    }
-
-    if (this.connection !== undefined) {
-      await this.connection.close().catch(() => undefined);
-      this.connection = undefined;
-    }
+    await Promise.all([
+      setup?.catch(() => undefined) ?? Promise.resolve(),
+      this.drain().catch(() => undefined),
+      ...cancellations,
+      disposeBrokerResourcesWithinBound(channel, connection)
+    ]);
   }
 
-  private async ensureChannel(): Promise<ConfirmChannel> {
-    if (this.channel !== undefined) {
-      return this.channel;
-    }
+  private async ensureChannel(signal?: AbortSignal): Promise<ConfirmChannel> {
+    signal?.throwIfAborted();
 
     if (this.closing) {
       throw new Error("RabbitMQ payload transport is closing.");
     }
 
-    const connection = await this.connectToBroker(this.url);
-    const channel = await connection.createConfirmChannel();
-    this.connection = connection;
-    this.channel = channel;
-    this.clearReconnectRetry();
+    if (this.channelSetup !== undefined) {
+      return this.waitForChannelSetup(this.channelSetup, signal);
+    }
 
-    connection.on("close", () => {
-      if (this.connection === connection) {
-        this.connection = undefined;
+    if (this.channel !== undefined) {
+      return this.channel;
+    }
+
+    const setupAbort = new AbortController();
+    const setupSignal = AbortSignal.any([
+      setupAbort.signal,
+      AbortSignal.timeout(DEFAULT_BROKER_CONNECT_TIMEOUT_MS)
+    ]);
+    const setup = this.openChannel(setupSignal);
+    this.channelSetup = setup;
+    this.channelSetupAbort = setupAbort;
+    void setup.finally(() => {
+      if (this.channelSetup === setup) {
+        this.channelSetup = undefined;
+        this.channelSetupAbort = undefined;
       }
+    }).catch(() => undefined);
 
-      this.markChannelClosed(channel, "connection-closed");
-    });
-    connection.on("error", () => {
-      if (this.connection === connection) {
-        this.connection = undefined;
-      }
+    return this.waitForChannelSetup(setup, signal);
+  }
 
-      this.markChannelClosed(channel, "connection-error");
-    });
-    channel.on("close", () => {
-      this.markChannelClosed(channel, "channel-closed");
-    });
-    channel.on("error", () => {
-      this.markChannelClosed(channel, "channel-error");
+  private async waitForChannelSetup(
+    setup: Promise<ConfirmChannel>,
+    signal: AbortSignal | undefined
+  ): Promise<ConfirmChannel> {
+    if (signal === undefined) {
+      return setup;
+    }
+
+    const setupAbort = this.channelSetupAbort;
+    const relayAbort = (): void => {
+      setupAbort?.abort(abortError(signal));
+    };
+
+    signal.addEventListener("abort", relayAbort, {
+      once: true
     });
 
-    await this.restoreConsumers(channel);
+    if (signal.aborted) {
+      relayAbort();
+    }
+
+    try {
+      return await waitForAbortableResult(setup, signal, () => undefined);
+    } finally {
+      signal.removeEventListener("abort", relayAbort);
+    }
+  }
+
+  private async openChannel(setupSignal: AbortSignal): Promise<ConfirmChannel> {
+    let connection: ChannelModel | undefined;
+    let channel: ConfirmChannel | undefined;
+
+    try {
+      setupSignal.throwIfAborted();
+      connection = await waitForAbortableResult(
+        this.connectToBroker(this.url),
+        setupSignal,
+        async (lateConnection) => {
+          await disposeBrokerResourcesWithinBound(undefined, lateConnection, setupSignal);
+        }
+      );
+      setupSignal.throwIfAborted();
+      channel = await waitForAbortableResult(
+        connection.createConfirmChannel(),
+        setupSignal,
+        async (lateChannel) => {
+          await disposeBrokerResourcesWithinBound(lateChannel, undefined, setupSignal);
+        }
+      );
+      setupSignal.throwIfAborted();
+      const activeConnection = connection;
+      const activeChannel = channel;
+
+      this.connection = activeConnection;
+      this.channel = activeChannel;
+
+      activeConnection.on("close", () => {
+        if (this.connection === activeConnection) {
+          this.connection = undefined;
+        }
+
+        this.markChannelClosed(activeChannel, "connection-closed");
+      });
+      activeConnection.on("error", () => {
+        if (this.connection === activeConnection) {
+          this.connection = undefined;
+        }
+
+        this.markChannelClosed(activeChannel, "connection-error");
+      });
+      activeChannel.on("close", () => {
+        this.markChannelClosed(activeChannel, "channel-closed");
+      });
+      activeChannel.on("error", () => {
+        this.markChannelClosed(activeChannel, "channel-error");
+      });
+
+      await this.restoreConsumers(activeChannel, setupSignal);
+      setupSignal.throwIfAborted();
+      this.clearReconnectRetry();
+    } catch (error: unknown) {
+      await this.discardChannelSetup(
+        connection,
+        channel,
+        "channel-setup-failed",
+        setupSignal
+      );
+      throw error;
+    }
 
     return channel;
   }
 
-  private async restoreConsumers(channel: ConfirmChannel): Promise<void> {
+  private async restoreConsumers(channel: ConfirmChannel, signal: AbortSignal): Promise<void> {
     for (const [stage, registration] of this.consumers) {
-      await this.activateConsumer(stage, registration, channel);
+      await this.activateConsumer(stage, registration, channel, signal);
     }
   }
 
   private async activateConsumer(
     stage: WorkerStage,
     registration: PayloadConsumerRegistration,
-    channel: ConfirmChannel
+    channel: ConfirmChannel,
+    signal: AbortSignal
   ): Promise<void> {
     if (registration.consumerTag !== undefined) {
       return;
     }
 
+    signal.throwIfAborted();
     const route = getWorkerRoute(stage);
     registration.monitor.markRecovering("consumer-activation");
-    await channel.prefetch(this.prefetchCount);
-    const reply = await channel.consume(route.mainQueue.name, (message) => {
-      if (message === null) {
-        registration.consumerTag = undefined;
-        registration.monitor.markCancelled("broker-cancelled-consumer");
-        this.recoverCancelledConsumer(stage, registration, channel);
-        return;
-      }
+    await waitForAbortableResult(
+      channel.prefetch(this.prefetchCount),
+      signal,
+      () => undefined
+    );
+    signal.throwIfAborted();
+    const reply = await waitForAbortableResult(
+      channel.consume(route.mainQueue.name, (message) => {
+        if (message === null) {
+          registration.consumerTag = undefined;
+          registration.monitor.markCancelled("broker-cancelled-consumer");
+          this.recoverCancelledConsumer(stage, registration, channel);
+          return;
+        }
 
-      const tracked = this.handleDelivery(stage, registration.handler, message);
-      this.inFlight.add(tracked);
-      void tracked.finally(() => {
-        this.inFlight.delete(tracked);
-      });
-    }, {
-      noAck: false
-    });
+        const tracked = this.handleDelivery(stage, registration.handler, message, channel);
+        this.inFlight.add(tracked);
+        const removeFromInFlight = (): void => {
+          this.inFlight.delete(tracked);
+        };
+        void tracked.then(removeFromInFlight, removeFromInFlight);
+      }, {
+        noAck: false
+      }),
+      signal,
+      async (lateReply) => {
+        await settleBrokerOperationWithinBound(
+          () => channel.cancel(lateReply.consumerTag)
+        );
+      }
+    );
+
+    try {
+      signal.throwIfAborted();
+    } catch (error: unknown) {
+      await settleBrokerOperationWithinBound(
+        () => channel.cancel(reply.consumerTag),
+        signal
+      );
+      throw error;
+    }
 
     registration.consumerTag = reply.consumerTag;
     registration.monitor.markActive("consumer-registered");
+  }
+
+  private async discardChannelSetup(
+    connection: ChannelModel | undefined,
+    channel: ConfirmChannel | undefined,
+    reason: string,
+    signal?: AbortSignal
+  ): Promise<void> {
+    const ownsChannel = channel !== undefined && this.channel === channel;
+    const ownsConnection = connection !== undefined && this.connection === connection;
+
+    if (ownsChannel) {
+      this.channel = undefined;
+      for (const registration of this.consumers.values()) {
+        registration.consumerTag = undefined;
+        registration.monitor.markChannelDropped(reason);
+      }
+    }
+
+    if (ownsConnection) {
+      this.connection = undefined;
+    }
+
+    await disposeBrokerResourcesWithinBound(channel, connection, signal);
   }
 
   private markChannelClosed(channel: ConfirmChannel, reason: string): void {
@@ -420,7 +620,11 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
       return;
     }
 
+    this.channelSetupAbort?.abort(new Error(`RabbitMQ channel setup failed: ${reason}.`));
     this.channel = undefined;
+    const connection = this.connection;
+    this.connection = undefined;
+    void disposeBrokerResourcesWithinBound(undefined, connection);
 
     for (const registration of this.consumers.values()) {
       registration.consumerTag = undefined;
@@ -439,8 +643,16 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
       return;
     }
 
-    void this.activateConsumer(stage, registration, channel).catch(() => {
-      this.markChannelClosed(channel, "consumer-reactivation-failed");
+    const connection = this.connection;
+    const setupSignal = AbortSignal.timeout(DEFAULT_BROKER_CONNECT_TIMEOUT_MS);
+    void this.activateConsumer(stage, registration, channel, setupSignal).catch(async () => {
+      await this.discardChannelSetup(
+        connection,
+        channel,
+        "consumer-reactivation-failed",
+        setupSignal
+      );
+      this.recoverConsumersAfterDisconnect();
     });
   }
 
@@ -483,14 +695,10 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
   private async handleDelivery(
     stage: WorkerStage,
     handler: BrokerDeliveryHandler,
-    message: ConsumeMessage
+    message: ConsumeMessage,
+    channel: ConfirmChannel
   ): Promise<void> {
-    const channel = this.channel;
     void stage;
-
-    if (channel === undefined) {
-      return;
-    }
 
     try {
       const carrier = decodeCarrier(message);
@@ -501,7 +709,12 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
       });
       await this.settleDelivery(channel, message, carrier, result);
     } catch {
-      channel.nack(message, false, false);
+      try {
+        channel.nack(message, false, false);
+      } catch {
+        // The originating channel may already be closed; the broker will redeliver
+        // any delivery that was not acknowledged before the connection dropped.
+      }
     }
   }
 
@@ -563,31 +776,58 @@ export class PostgresTranslationTransactionRunner implements TranslationDatabase
     return probePool(this.pool, "translation transaction database ready");
   }
 
-  async withTransaction<T>(operation: (transaction: TranslationDatabaseTransaction) => Promise<T>): Promise<T> {
+  async withTransaction<T>(
+    operation: (transaction: TranslationDatabaseTransaction) => Promise<T>,
+    signal?: AbortSignal
+  ): Promise<T> {
+    signal?.throwIfAborted();
     const client = await this.pool.connect();
     const transaction: PgTranslationTransaction = {
       transactionId: randomUUID(),
       client
     };
+    let releaseError: Error | undefined;
 
     try {
+      signal?.throwIfAborted();
       await client.query("BEGIN");
+      signal?.throwIfAborted();
       const value = await operation(transaction);
+      signal?.throwIfAborted();
       await client.query("COMMIT");
       return value;
     } catch (error: unknown) {
-      await client.query("ROLLBACK").catch(() => undefined);
+      try {
+        await client.query("ROLLBACK");
+      } catch (caught: unknown) {
+        releaseError = errorFromUnknown(caught, "Postgres transaction rollback failed.");
+      }
+
       throw error;
     } finally {
-      client.release();
+      if (releaseError === undefined) {
+        client.release();
+      } else {
+        client.release(releaseError);
+      }
     }
   }
 }
 
 export class PostgresTranslationStateStore implements TranslationStateStore {
   readonly name = "postgres-translation-state";
+  private readonly leaseRenewals = new Map<string, ReturnType<typeof setInterval>>();
+  private readonly leaseRenewalsInFlight = new Set<string>();
 
   constructor(private readonly pool: Pool) {}
+
+  close(): void {
+    for (const renewal of this.leaseRenewals.values()) {
+      clearInterval(renewal);
+    }
+
+    this.leaseRenewals.clear();
+  }
 
   async probe(): Promise<TranslationDependencyProbe> {
     return probePool(this.pool, "translation state database ready");
@@ -597,12 +837,24 @@ export class PostgresTranslationStateStore implements TranslationStateStore {
     idempotencyKey: string,
     context: RuntimeIdempotencyClaimContext
   ): Promise<RuntimeIdempotencyClaimResult> {
+    const claimToken = randomUUID();
     const inserted = await this.pool.query<{ readonly received_at: Date }>(
       `INSERT INTO ${TRANSLATION_SCHEMA}.inbox (
         message_id, pipeline_run_id, stage_execution_id, source_stage, source_message_id,
         entity_kind, entity_id, schema_version, operation_version, idempotency_key,
         payload_ref, payload_digest, received_at, status, diagnostic_metadata
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::timestamptz, 'processing', $14::jsonb)
+      ) VALUES (
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+        $13::timestamptz,
+        'processing',
+        $14::jsonb || jsonb_build_object(
+          'idempotencyClaimToken', $15::text,
+          'idempotencyClaimExpiresAt', to_char(
+            (clock_timestamp() + ($16::double precision * interval '1 millisecond')) AT TIME ZONE 'UTC',
+            'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
+          )
+        )
+      )
       ON CONFLICT (idempotency_key) DO NOTHING
       RETURNING received_at`,
       [
@@ -622,15 +874,111 @@ export class PostgresTranslationStateStore implements TranslationStateStore {
         JSON.stringify({
           route: context.envelope.route,
           attempt: context.envelope.attempt
-        })
+        }),
+        claimToken,
+        TRANSLATION_IDEMPOTENCY_LEASE_MS
       ]
     );
 
     if ((inserted.rowCount ?? 0) > 0) {
+      this.startLeaseRenewal(idempotencyKey, claimToken);
+
       return {
         status: "claimed",
         firstSeenAt: context.receivedAt,
-        replay: false
+        replay: false,
+        claimToken
+      };
+    }
+
+    await this.pool.query(
+      `UPDATE ${TRANSLATION_SCHEMA}.inbox
+       SET diagnostic_metadata = jsonb_set(
+         coalesce(diagnostic_metadata, '{}'::jsonb),
+         '{idempotencyClaimExpiresAt}',
+         to_jsonb(to_char(
+           (clock_timestamp() + ($2::double precision * interval '1 millisecond')) AT TIME ZONE 'UTC',
+           'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
+         )),
+         true
+       )
+       WHERE idempotency_key = $1
+         AND status = 'processing'
+         AND CASE
+           WHEN coalesce(diagnostic_metadata->>'idempotencyClaimExpiresAt', '')
+             ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]+)?Z$'
+             AND pg_input_is_valid(
+               coalesce(diagnostic_metadata->>'idempotencyClaimExpiresAt', ''),
+               'timestamptz'
+             )
+             THEN (diagnostic_metadata->>'idempotencyClaimExpiresAt')::timestamptz
+               > clock_timestamp() + ($2::double precision * interval '1 millisecond')
+           ELSE true
+         END
+       RETURNING status`,
+      [
+        idempotencyKey,
+        TRANSLATION_IDEMPOTENCY_LEASE_MS
+      ]
+    );
+
+    const reclaimed = await this.pool.query<{ readonly received_at: Date }>(
+      `UPDATE ${TRANSLATION_SCHEMA}.inbox
+       SET status = 'processing',
+           processed_at = NULL,
+           sanitized_error_code = NULL,
+           sanitized_error_message = NULL,
+           diagnostic_metadata = (
+             diagnostic_metadata
+             - 'idempotencyClaimToken'
+             - 'idempotencyClaimExpiresAt'
+           ) || $2::jsonb || jsonb_build_object(
+             'replayedAt', to_char(
+               clock_timestamp() AT TIME ZONE 'UTC',
+               'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
+             ),
+             'idempotencyClaimExpiresAt', to_char(
+               (clock_timestamp() + ($3::double precision * interval '1 millisecond')) AT TIME ZONE 'UTC',
+               'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
+             )
+           )
+       WHERE idempotency_key = $1
+         AND (
+           status IN ('failed', 'parked')
+           OR (
+             status = 'processing'
+             AND CASE
+               WHEN coalesce(diagnostic_metadata->>'idempotencyClaimExpiresAt', '')
+                 ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]+)?Z$'
+                 AND pg_input_is_valid(
+                   coalesce(diagnostic_metadata->>'idempotencyClaimExpiresAt', ''),
+                   'timestamptz'
+                 )
+                 THEN (diagnostic_metadata->>'idempotencyClaimExpiresAt')::timestamptz
+               ELSE 'infinity'::timestamptz
+             END <= clock_timestamp()
+           )
+         )
+       RETURNING received_at`,
+      [
+        idempotencyKey,
+        JSON.stringify({
+          replayMessageId: context.envelope.messageId,
+          idempotencyClaimToken: claimToken
+        }),
+        TRANSLATION_IDEMPOTENCY_LEASE_MS
+      ]
+    );
+    const reclaimedRow = reclaimed.rows[0];
+
+    if (reclaimedRow !== undefined) {
+      this.startLeaseRenewal(idempotencyKey, claimToken);
+
+      return {
+        status: "claimed",
+        firstSeenAt: reclaimedRow.received_at.toISOString(),
+        replay: true,
+        claimToken
       };
     }
 
@@ -663,30 +1011,6 @@ export class PostgresTranslationStateStore implements TranslationStateStore {
       };
     }
 
-    if (row.status === "failed" || row.status === "parked") {
-      await this.pool.query(
-        `UPDATE ${TRANSLATION_SCHEMA}.inbox
-         SET status = 'processing',
-             sanitized_error_code = NULL,
-             sanitized_error_message = NULL,
-             diagnostic_metadata = diagnostic_metadata || $2::jsonb
-         WHERE idempotency_key = $1`,
-        [
-          idempotencyKey,
-          JSON.stringify({
-            replayedAt: context.receivedAt,
-            replayMessageId: context.envelope.messageId
-          })
-        ]
-      );
-
-      return {
-        status: "claimed",
-        firstSeenAt,
-        replay: true
-      };
-    }
-
     return {
       status: "in-progress",
       firstSeenAt
@@ -694,42 +1018,203 @@ export class PostgresTranslationStateStore implements TranslationStateStore {
   }
 
   async markCompleted(idempotencyKey: string, completion: RuntimeIdempotencyCompletion): Promise<void> {
-    await this.pool.query(
-      `UPDATE ${TRANSLATION_SCHEMA}.inbox
-       SET status = 'processed',
-           processed_at = $2::timestamptz,
-           diagnostic_metadata = diagnostic_metadata || $3::jsonb
-       WHERE idempotency_key = $1`,
-      [
-        idempotencyKey,
-        completion.completedAt,
-        JSON.stringify({
-          completedMessageId: completion.messageId,
-          completedStage: completion.stage
-        })
-      ]
-    );
+    try {
+      const updated = await this.pool.query(
+        `UPDATE ${TRANSLATION_SCHEMA}.inbox
+         SET status = 'processed',
+             processed_at = $2::timestamptz,
+             diagnostic_metadata = (
+               diagnostic_metadata
+               - 'idempotencyClaimToken'
+               - 'idempotencyClaimExpiresAt'
+             ) || $3::jsonb
+         WHERE idempotency_key = $1
+           AND status = 'processing'
+           AND diagnostic_metadata->>'idempotencyClaimToken' = $4
+         RETURNING status`,
+        [
+          idempotencyKey,
+          completion.completedAt,
+          JSON.stringify({
+            completedMessageId: completion.messageId,
+            completedStage: completion.stage
+          }),
+          completion.claimToken
+        ]
+      );
+
+      if ((updated.rowCount ?? 0) !== 1) {
+        throw new Error("Cannot complete an idempotency claim owned by another delivery.");
+      }
+    } finally {
+      this.stopLeaseRenewal(completion.claimToken);
+    }
   }
 
   async markFailed(idempotencyKey: string, failure: RuntimeIdempotencyFailure): Promise<void> {
-    await this.pool.query(
-      `UPDATE ${TRANSLATION_SCHEMA}.inbox
-       SET status = 'failed',
-           sanitized_error_code = $2,
-           sanitized_error_message = $3,
-           diagnostic_metadata = diagnostic_metadata || $4::jsonb
-       WHERE idempotency_key = $1`,
-      [
-        idempotencyKey,
-        sanitizeCode(failure.reason),
-        sanitizeMessage(failure.reason),
-        JSON.stringify({
-          failedAt: failure.failedAt,
-          failedMessageId: failure.messageId,
-          retryable: failure.retryable
-        })
-      ]
-    );
+    try {
+      const updated = await this.pool.query(
+        `UPDATE ${TRANSLATION_SCHEMA}.inbox
+         SET status = 'failed',
+             sanitized_error_code = $2,
+             sanitized_error_message = $3,
+             diagnostic_metadata = (
+               diagnostic_metadata
+               - 'idempotencyClaimToken'
+               - 'idempotencyClaimExpiresAt'
+             ) || $4::jsonb
+         WHERE idempotency_key = $1
+           AND status = 'processing'
+           AND diagnostic_metadata->>'idempotencyClaimToken' = $5
+         RETURNING status`,
+        [
+          idempotencyKey,
+          sanitizeCode(failure.reason),
+          sanitizeMessage(failure.reason),
+          JSON.stringify({
+            failedAt: failure.failedAt,
+            failedMessageId: failure.messageId,
+            retryable: failure.retryable
+          }),
+          failure.claimToken
+        ]
+      );
+
+      if ((updated.rowCount ?? 0) !== 1) {
+        throw new Error("Cannot fail an idempotency claim owned by another delivery.");
+      }
+    } finally {
+      this.stopLeaseRenewal(failure.claimToken);
+    }
+  }
+
+  async releaseClaim(
+    idempotencyKey: string,
+    failure: RuntimeIdempotencyFailure
+  ): Promise<RuntimeIdempotencyClaimReleaseResult> {
+    try {
+      const released = await this.pool.query(
+        `UPDATE ${TRANSLATION_SCHEMA}.inbox
+         SET status = 'failed',
+             sanitized_error_code = $2,
+             sanitized_error_message = $3,
+             diagnostic_metadata = (
+               diagnostic_metadata
+               - 'idempotencyClaimToken'
+               - 'idempotencyClaimExpiresAt'
+             ) || $4::jsonb
+         WHERE idempotency_key = $1
+           AND status = 'processing'
+           AND diagnostic_metadata->>'idempotencyClaimToken' = $5
+         RETURNING status`,
+        [
+          idempotencyKey,
+          sanitizeCode(failure.reason),
+          sanitizeMessage(failure.reason),
+          JSON.stringify({
+            releasedAt: failure.failedAt,
+            releasedMessageId: failure.messageId,
+            retryable: failure.retryable
+          }),
+          failure.claimToken
+        ]
+      );
+
+      if ((released.rowCount ?? 0) === 1) {
+        return {
+          status: "released"
+        };
+      }
+
+      const current = await this.pool.query<{ readonly status: string }>(
+        `SELECT status
+         FROM ${TRANSLATION_SCHEMA}.inbox
+         WHERE idempotency_key = $1`,
+        [idempotencyKey]
+      );
+
+      if (current.rows[0]?.status === "processed" || current.rows[0]?.status === "duplicate") {
+        return {
+          status: "preserved-completed"
+        };
+      }
+
+      return {
+        status: "not-owned"
+      };
+    } finally {
+      this.stopLeaseRenewal(failure.claimToken);
+    }
+  }
+
+  private startLeaseRenewal(idempotencyKey: string, claimToken: string): void {
+    this.stopLeaseRenewal(claimToken);
+    const renewal = setInterval(() => {
+      if (this.leaseRenewalsInFlight.has(claimToken)) {
+        return;
+      }
+
+      this.leaseRenewalsInFlight.add(claimToken);
+      void this.renewLease(idempotencyKey, claimToken).finally(() => {
+        this.leaseRenewalsInFlight.delete(claimToken);
+      });
+    }, TRANSLATION_IDEMPOTENCY_RENEWAL_INTERVAL_MS);
+
+    renewal.unref();
+    this.leaseRenewals.set(claimToken, renewal);
+  }
+
+  private stopLeaseRenewal(claimToken: string): void {
+    const renewal = this.leaseRenewals.get(claimToken);
+
+    if (renewal !== undefined) {
+      clearInterval(renewal);
+      this.leaseRenewals.delete(claimToken);
+    }
+  }
+
+  private async renewLease(idempotencyKey: string, claimToken: string): Promise<void> {
+    try {
+      const renewed = await this.pool.query(
+        `UPDATE ${TRANSLATION_SCHEMA}.inbox
+         SET diagnostic_metadata = jsonb_set(
+           diagnostic_metadata,
+           '{idempotencyClaimExpiresAt}',
+           to_jsonb(to_char(
+             (clock_timestamp() + ($3::double precision * interval '1 millisecond')) AT TIME ZONE 'UTC',
+             'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
+           )),
+           true
+         )
+         WHERE idempotency_key = $1
+           AND status = 'processing'
+           AND diagnostic_metadata->>'idempotencyClaimToken' = $2
+           AND CASE
+             WHEN coalesce(diagnostic_metadata->>'idempotencyClaimExpiresAt', '')
+               ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]+)?Z$'
+               AND pg_input_is_valid(
+                 coalesce(diagnostic_metadata->>'idempotencyClaimExpiresAt', ''),
+                 'timestamptz'
+               )
+               THEN (diagnostic_metadata->>'idempotencyClaimExpiresAt')::timestamptz
+                 > clock_timestamp()
+             ELSE false
+           END
+         RETURNING status`,
+        [
+          idempotencyKey,
+          claimToken,
+          TRANSLATION_IDEMPOTENCY_LEASE_MS
+        ]
+      );
+
+      if ((renewed.rowCount ?? 0) !== 1) {
+        this.stopLeaseRenewal(claimToken);
+      }
+    } catch {
+      // A transient renewal failure leaves the existing bounded lease in force.
+      // The next interval may recover it, while every update remains token-CAS.
+    }
   }
 
   async findLanguageResult(
@@ -1794,6 +2279,13 @@ export class LocalAiTranslationQwenClient implements TranslationQwenClient {
 
     const startedAtMs = this.clock.now().getTime();
     let response: Response;
+    const requestTimeoutSignal = AbortSignal.timeout(request.timeoutMs);
+    const signal = request.signal === undefined
+      ? requestTimeoutSignal
+      : AbortSignal.any([
+          request.signal,
+          requestTimeoutSignal
+        ]);
 
     try {
       response = await this.fetcher(`${this.baseUrl}/translate`, {
@@ -1811,9 +2303,11 @@ export class LocalAiTranslationQwenClient implements TranslationQwenClient {
           summary: shadowSourceSummary(request.input.articleId),
           category: "Uplifting"
         }),
-        signal: AbortSignal.timeout(request.timeoutMs)
+        signal
       });
     } catch (error: unknown) {
+      request.signal?.throwIfAborted();
+
       if (error instanceof Error && error.name === "TimeoutError") {
         throw new TranslationQwenError("qwen-timeout", {
           retryable: true
@@ -1926,6 +2420,126 @@ function transactionClient(transaction: TranslationDatabaseTransaction): PoolCli
   return client;
 }
 
+function publishSignal(command: BrokerPublishCommand): AbortSignal | undefined {
+  return (command as AbortableBrokerPublishCommand)[TRANSLATION_PUBLISH_ABORT_SIGNAL];
+}
+
+function waitForAbortableResult<T>(
+  operation: Promise<T>,
+  signal: AbortSignal,
+  disposeLateResult: (value: T) => void | Promise<void>
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const removeAbortListener = (): void => {
+      signal.removeEventListener("abort", onAbort);
+    };
+    const onAbort = (): void => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      removeAbortListener();
+      reject(abortError(signal));
+    };
+
+    signal.addEventListener("abort", onAbort, {
+      once: true
+    });
+
+    if (signal.aborted) {
+      onAbort();
+    }
+
+    void operation.then(
+      (value) => {
+        if (settled) {
+          void Promise.resolve(disposeLateResult(value)).catch(() => undefined);
+          return;
+        }
+
+        settled = true;
+        removeAbortListener();
+        resolve(value);
+      },
+      (error: unknown) => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        removeAbortListener();
+        reject(errorFromUnknown(error, "RabbitMQ operation failed."));
+      }
+    );
+  });
+}
+
+async function settleBrokerOperationWithinBound(
+  operation: () => Promise<unknown>,
+  signal?: AbortSignal
+): Promise<void> {
+  const timeoutSignal = AbortSignal.timeout(DEFAULT_BROKER_DISPOSAL_TIMEOUT_MS);
+  const disposalSignal = signal === undefined
+    ? timeoutSignal
+    : AbortSignal.any([
+        signal,
+        timeoutSignal
+      ]);
+  let pending: Promise<unknown>;
+
+  try {
+    pending = operation();
+  } catch {
+    return;
+  }
+
+  await waitForAbortableResult(
+    pending.then(() => undefined),
+    disposalSignal,
+    () => undefined
+  ).catch(() => undefined);
+}
+
+async function disposeBrokerResourcesWithinBound(
+  channel: ConfirmChannel | undefined,
+  connection: ChannelModel | undefined,
+  signal?: AbortSignal
+): Promise<void> {
+  await Promise.all([
+    channel === undefined
+      ? Promise.resolve()
+      : settleBrokerOperationWithinBound(() => channel.close(), signal),
+    connection === undefined
+      ? Promise.resolve()
+      : settleBrokerOperationWithinBound(() => connection.close(), signal)
+  ]);
+}
+
+function abortError(signal: AbortSignal | undefined): Error {
+  const reason: unknown = signal?.reason;
+
+  if (reason instanceof Error) {
+    return reason;
+  }
+
+  const error = new Error("Operation aborted.", {
+    cause: reason
+  });
+  error.name = "AbortError";
+
+  return error;
+}
+
+function errorFromUnknown(error: unknown, message: string): Error {
+  return error instanceof Error
+    ? error
+    : new Error(message, {
+        cause: error
+      });
+}
+
 async function publishCarrierWithConfirm(
   channel: ConfirmChannel,
   options: {
@@ -1934,8 +2548,10 @@ async function publishCarrierWithConfirm(
     readonly routingKey: string;
     readonly confirmTimeoutMs: number;
     readonly retryJitterMs?: number;
+    readonly signal?: AbortSignal;
   }
 ): Promise<void> {
+  options.signal?.throwIfAborted();
   const content = Buffer.from(JSON.stringify(options.carrier), "utf8");
   let timeout: ReturnType<typeof setTimeout> | undefined;
   let settled = false;
@@ -1949,6 +2565,7 @@ async function publishCarrierWithConfirm(
       channel.off("return", onReturn);
       channel.off("close", onClose);
       channel.off("error", onChannelError);
+      options.signal?.removeEventListener("abort", onAbort);
       settled = true;
     };
     const fail = (error: Error): void => {
@@ -1970,6 +2587,9 @@ async function publishCarrierWithConfirm(
     const onChannelError = (): void => {
       fail(new Error("RabbitMQ channel errored during publish."));
     };
+    const onAbort = (): void => {
+      fail(abortError(options.signal));
+    };
 
     timeout = setTimeout(() => {
       fail(new Error("RabbitMQ publish confirm timed out."));
@@ -1978,23 +2598,32 @@ async function publishCarrierWithConfirm(
     channel.on("return", onReturn);
     channel.on("close", onClose);
     channel.on("error", onChannelError);
-    channel.publish(
-      options.exchange,
-      options.routingKey,
-      content,
-      publishOptions(options.carrier.envelope, options.retryJitterMs),
-      (error: unknown) => {
-        if (error !== null && error !== undefined) {
-          fail(error instanceof Error ? error : new Error("RabbitMQ publish confirm failed."));
-          return;
-        }
+    options.signal?.addEventListener("abort", onAbort, {
+      once: true
+    });
 
-        if (!settled) {
-          cleanup();
-          resolve();
+    try {
+      options.signal?.throwIfAborted();
+      channel.publish(
+        options.exchange,
+        options.routingKey,
+        content,
+        publishOptions(options.carrier.envelope, options.retryJitterMs),
+        (error: unknown) => {
+          if (error !== null && error !== undefined) {
+            fail(error instanceof Error ? error : new Error("RabbitMQ publish confirm failed."));
+            return;
+          }
+
+          if (!settled) {
+            cleanup();
+            resolve();
+          }
         }
-      }
-    );
+      );
+    } catch (error: unknown) {
+      fail(errorFromUnknown(error, "RabbitMQ publish failed before dispatch."));
+    }
   });
 }
 

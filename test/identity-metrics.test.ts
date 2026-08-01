@@ -20,7 +20,8 @@ describe("translation immutable telemetry identity", () => {
         revision: BUILD_REVISION,
         deployment: "shadow",
         adapter: "production"
-      }
+      },
+      expectedActive: false
     }).collect();
     const identitySamples = output.split("\n").filter((line) => line.startsWith("nutsnews_worker_build_info{")
       || line.startsWith("nutsnews_worker_deployment_info{"));
@@ -28,7 +29,7 @@ describe("translation immutable telemetry identity", () => {
 
     expect(identitySamples).toHaveLength(2);
     expect(expectedActiveSamples).toEqual([
-      'nutsnews_worker_expected_active{environment="production",service="translation"} 0'
+      'nutsnews_worker_expected_active{environment="production",service="nutsnews-worker-article-translation"} 0'
     ]);
     expect(identitySamples.join("\n")).toContain(`revision="${BUILD_REVISION}"`);
     expect(identitySamples.join("\n")).toContain('deployment="shadow"');

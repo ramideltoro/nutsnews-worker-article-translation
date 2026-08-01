@@ -20,12 +20,14 @@ import {
 import { loadTranslationConfig } from "../src/config.js";
 import {
   TRANSLATION_DURATION_BUCKETS_SECONDS,
+  TRANSLATION_RUNTIME_HEALTH_CHECKS,
   createTranslationPrometheusMetricsSink,
   type TranslationPrometheusMetricsSink
 } from "../src/metrics.js";
 import { createTranslationService } from "../src/service.js";
 import {
   LocalBrokerTransport,
+  LocalTranslationQwenClient,
   LocalTranslationWorkHandler,
   createLocalTranslationDependencies,
   createMinimalTranslationDelivery,
@@ -62,6 +64,9 @@ describe("translation lifecycle telemetry", () => {
       ...TRANSLATION_DURATION_BUCKETS_SECONDS.map(String),
       "+Inf"
     ]);
+    expect(TRANSLATION_DURATION_BUCKETS_SECONDS).toContain(0.005);
+    expect(TRANSLATION_DURATION_BUCKETS_SECONDS).toContain(0.025);
+    expect(sampleValue(initial, "nutsnews_worker_last_success_timestamp_seconds")).toBe(0);
 
     await context.metrics.emit({
       name: "runtime.message.accepted",
@@ -77,6 +82,101 @@ describe("translation lifecycle telemetry", () => {
     expect(canonicalStageSeriesKeys(afterTraffic)).toEqual(canonicalStageSeriesKeys(initial));
     expect(metricValue(afterTraffic, "nutsnews_worker_uplift_stage_events_total", "success")).toBe(1);
     expect(sampleValue(afterTraffic, "nutsnews_worker_uplift_stage_latency_seconds_count")).toBe(1);
+    expect(sampleValue(afterTraffic, "nutsnews_worker_last_success_timestamp_seconds")).toBe(
+      Date.parse("2026-07-23T00:00:00.000Z") / 1_000
+    );
+  });
+
+  it("advances Runtime last-success monotonically for accepted and already-completed duplicate outcomes", async () => {
+    const metrics = createTelemetryContext().metrics;
+    const acceptedAt = "2026-08-01T03:00:00.900Z";
+    const olderDuplicateAt = "2026-08-01T02:00:00.000Z";
+    const newerDuplicateAt = "2026-08-01T04:00:00.100Z";
+
+    await metrics.emit(translationCompletionEvent("runtime.message.accepted", acceptedAt));
+    expect(sampleValue(metrics.collect(), "nutsnews_worker_last_success_timestamp_seconds")).toBe(
+      Math.floor(Date.parse(acceptedAt) / 1_000)
+    );
+
+    await metrics.emit(translationCompletionEvent("runtime.message.duplicate", olderDuplicateAt, {
+      completedAt: "2026-08-01T01:00:00.000Z"
+    }));
+    expect(sampleValue(metrics.collect(), "nutsnews_worker_last_success_timestamp_seconds")).toBe(
+      Math.floor(Date.parse(acceptedAt) / 1_000)
+    );
+
+    await metrics.emit(translationCompletionEvent("runtime.message.duplicate", newerDuplicateAt, {
+      completedAt: acceptedAt
+    }));
+    expect(sampleValue(metrics.collect(), "nutsnews_worker_last_success_timestamp_seconds")).toBe(
+      Math.floor(Date.parse(newerDuplicateAt) / 1_000)
+    );
+
+    await metrics.emit(translationCompletionEvent("runtime.message.duplicate", "2026-08-01T05:00:00.000Z"));
+    expect(sampleValue(metrics.collect(), "nutsnews_worker_last_success_timestamp_seconds")).toBe(
+      Math.floor(Date.parse(newerDuplicateAt) / 1_000)
+    );
+  });
+
+  it("keeps Runtime in-flight truthful while concurrent deliveries complete independently", async () => {
+    const context = createTelemetryContext();
+    const gates = [
+      deferred<undefined>(),
+      deferred<undefined>()
+    ];
+    const starts = [
+      deferred<undefined>(),
+      deferred<undefined>()
+    ];
+    let invocation = 0;
+
+    vi.spyOn(context.workHandler, "handle").mockImplementation(async (_message, _tools, signal) => {
+      const gate = gates[invocation];
+      const started = starts[invocation];
+      invocation += 1;
+
+      if (gate === undefined || started === undefined) {
+        throw new Error("Unexpected translation handler invocation.");
+      }
+
+      started.resolve(undefined);
+      await gate.promise;
+      signal.throwIfAborted();
+
+      return {
+        status: "ok"
+      };
+    });
+
+    await context.service.start();
+    const first = context.broker.deliverTranslation(translationDelivery(31));
+    await starts[0]?.promise;
+    const second = context.broker.deliverTranslation(translationDelivery(32));
+    await starts[1]?.promise;
+
+    expect(sampleValue(context.metrics.collect(), "nutsnews_worker_inflight", {
+      queue: "nutsnews.worker.translation.v1"
+    })).toBe(2);
+
+    gates[0]?.resolve(undefined);
+    await expect(first).resolves.toMatchObject({
+      action: "ack",
+      reason: "handled"
+    });
+    expect(sampleValue(context.metrics.collect(), "nutsnews_worker_inflight", {
+      queue: "nutsnews.worker.translation.v1"
+    })).toBe(1);
+
+    gates[1]?.resolve(undefined);
+    await expect(second).resolves.toMatchObject({
+      action: "ack",
+      reason: "handled"
+    });
+    expect(sampleValue(context.metrics.collect(), "nutsnews_worker_inflight", {
+      queue: "nutsnews.worker.translation.v1"
+    })).toBe(0);
+
+    await context.service.stop();
   });
 
   it("emits one completing event for accepted, duplicate, invalid, retry, retry-exhausted, and terminal deliveries", async () => {
@@ -118,7 +218,7 @@ describe("translation lifecycle telemetry", () => {
     });
     expect(completions[2]).toMatchObject({
       name: "runtime.message.invalid",
-      outcome: "failure",
+      outcome: "invalid",
       attributes: {
         issueCode: "payload-consumer-mismatch",
         issuePath: "$.schemaId"
@@ -168,14 +268,14 @@ describe("translation lifecycle telemetry", () => {
       operation: "markCompleted",
       action: "retry",
       completion: "runtime.message.retry",
-      reason: "idempotency-mark-completed-error",
+      reason: "idempotency-completion-error",
       attemptCount: 1
     },
     {
       operation: "markFailed",
       action: "retry",
       completion: "runtime.message.retry",
-      reason: "idempotency-mark-failed-error",
+      reason: "idempotency-failure-record-error",
       attemptCount: 1
     }
   ] as const)("contains $operation failure as one $action completion", async ({
@@ -226,6 +326,93 @@ describe("translation lifecycle telemetry", () => {
     expect(metricValue(context.metrics.collect(), "nutsnews_worker_uplift_stage_events_total", action)).toBe(1);
     expect(context.workHandler.handled).toHaveLength(operation === "claim" ? 0 : 1);
 
+    await context.service.stop();
+  });
+
+  it("does not release an ambiguously committed claim without an ownership token", async () => {
+    const context = createTelemetryContext();
+    const store = context.dependencies.stateStore;
+    const originalClaim = store.claim.bind(store);
+    const releaseClaim = vi.spyOn(store, "releaseClaim");
+    vi.spyOn(store, "claim").mockImplementationOnce(async (key, claimContext) => {
+      await originalClaim(key, claimContext);
+      throw new Error("claim response lost after commit");
+    });
+
+    await context.service.start();
+    const delivery = translationDelivery(10);
+
+    await expect(context.broker.deliverTranslation(delivery)).resolves.toMatchObject({
+      action: "retry",
+      reason: "idempotency-claim-error"
+    });
+    await expect(context.broker.deliverTranslation(delivery)).resolves.toMatchObject({
+      action: "retry",
+      reason: "idempotency-in-progress"
+    });
+    expect(releaseClaim).not.toHaveBeenCalled();
+    expect(context.workHandler.handled).toHaveLength(0);
+    await context.service.stop();
+  });
+
+  it("conditionally releases completion rejected before commit and succeeds on replay", async () => {
+    const context = createTelemetryContext();
+    const store = context.dependencies.stateStore;
+    const releaseClaim = vi.spyOn(store, "releaseClaim");
+    vi.spyOn(store, "markCompleted").mockRejectedValueOnce(
+      new Error("completion rejected before commit")
+    );
+
+    await context.service.start();
+    const delivery = translationDelivery(11);
+
+    await expect(context.broker.deliverTranslation(delivery)).resolves.toMatchObject({
+      action: "retry",
+      reason: "idempotency-completion-error"
+    });
+    expect(releaseClaim).toHaveBeenCalledTimes(1);
+    await expect(context.broker.deliverTranslation(delivery)).resolves.toMatchObject({
+      action: "ack",
+      reason: "handled"
+    });
+    expect(context.workHandler.handled).toHaveLength(2);
+    await context.service.stop();
+  });
+
+  it("acknowledges commit-then-reject completion on the final attempt", async () => {
+    const context = createTelemetryContext();
+    const store = context.dependencies.stateStore;
+    const originalMarkCompleted = store.markCompleted.bind(store);
+    const releaseClaim = vi.spyOn(store, "releaseClaim");
+    vi.spyOn(store, "markCompleted").mockImplementationOnce(
+      async (key, completion) => {
+        await originalMarkCompleted(key, completion);
+        throw new Error("completion response lost after commit");
+      }
+    );
+
+    await context.service.start();
+    context.telemetry.clear();
+    const delivery = translationDelivery(12, {
+      attempt: {
+        count: WORKER_DELIVERY_BEHAVIOR.maxAttempts,
+        max: WORKER_DELIVERY_BEHAVIOR.maxAttempts,
+        firstAttemptAt: "2026-07-23T00:00:00.000Z",
+        lastAttemptAt: "2026-07-23T00:05:00.000Z"
+      }
+    });
+
+    await expect(context.broker.deliverTranslation(delivery)).resolves.toMatchObject({
+      action: "ack",
+      reason: "handled"
+    });
+    expect(releaseClaim).toHaveBeenCalledTimes(1);
+    expect(context.telemetry.events.filter(
+      (event) => event.name === "runtime.message.accepted"
+    )).toHaveLength(1);
+    expect(context.telemetry.events.some(
+      (event) => event.name === "runtime.message.dlq"
+    )).toBe(false);
     await context.service.stop();
   });
 
@@ -295,22 +482,40 @@ describe("translation lifecycle telemetry", () => {
     const context = createTelemetryContext();
 
     const initial = context.metrics.collect();
-    expectHealthOneHot(initial, "liveness", "ok");
-    expectHealthOneHot(initial, "startup", "unhealthy");
-    expectHealthOneHot(initial, "readiness", "unhealthy");
-    expect(sampleValue(initial, "nutsnews_worker_consumer_active", {
-      queue: "nutsnews.worker.translation.v1"
-    })).toBe(0);
+    expect(initial).not.toContain("nutsnews_worker_health_probe{");
+    expect(initial).not.toContain("nutsnews_worker_consumers{");
+
+    await expect(context.service.health.liveness()).resolves.toMatchObject({
+      status: "ok"
+    });
+    await expect(context.service.health.startup()).resolves.toMatchObject({
+      status: "unhealthy"
+    });
+    await expect(context.service.health.readiness()).resolves.toMatchObject({
+      status: "unhealthy"
+    });
+    const beforeStart = context.metrics.collect();
+    expectHealthOneHot(beforeStart, "liveness", "ok");
+    expectHealthOneHot(beforeStart, "startup", "unhealthy");
+    expectHealthOneHot(beforeStart, "readiness", "unhealthy");
 
     await context.service.start();
     const started = context.metrics.collect();
     expectHealthOneHot(started, "liveness", "ok");
     expectHealthOneHot(started, "startup", "ok");
     expectHealthOneHot(started, "readiness", "ok");
-    expect(sampleValue(started, "nutsnews_worker_consumer_active", {
+    expect(sampleValue(started, "nutsnews_worker_consumers", {
       queue: "nutsnews.worker.translation.v1"
     })).toBe(1);
     expect(started).not.toContain("nutsnews_worker_dependency_duration_ms");
+    const healthDurationCountBeforeChannelDrop = sampleValue(
+      started,
+      "nutsnews_worker_health_check_duration_seconds_count",
+      {
+        check: "rabbitmq-consumer",
+        probe: "readiness"
+      }
+    );
 
     await context.metrics.emit({
       name: "runtime.broker.consumer_state_changed",
@@ -324,10 +529,25 @@ describe("translation lifecycle telemetry", () => {
         state: "channel-dropped"
       }
     });
-    expectHealthOneHot(context.metrics.collect(), "readiness", "unhealthy");
-    expect(sampleValue(context.metrics.collect(), "nutsnews_worker_consumer_active", {
+    const channelDropped = context.metrics.collect();
+    expect(sampleValue(channelDropped, "nutsnews_worker_consumers", {
       queue: "nutsnews.worker.translation.v1"
     })).toBe(0);
+    expectHealthOneHot(channelDropped, "readiness", "unhealthy");
+    expect(sampleValue(channelDropped, "nutsnews_worker_health_check", {
+      check: "rabbitmq-consumer",
+      outcome: "unhealthy",
+      probe: "readiness"
+    })).toBe(1);
+    expect(sampleValue(channelDropped, "nutsnews_worker_health_check", {
+      check: "rabbitmq-consumer",
+      outcome: "ok",
+      probe: "readiness"
+    })).toBe(0);
+    expect(sampleValue(channelDropped, "nutsnews_worker_health_check_duration_seconds_count", {
+      check: "rabbitmq-consumer",
+      probe: "readiness"
+    })).toBe(healthDurationCountBeforeChannelDrop);
 
     await context.metrics.emit({
       name: "runtime.broker.consumer_state_changed",
@@ -341,10 +561,11 @@ describe("translation lifecycle telemetry", () => {
         state: "active"
       }
     });
-    expectHealthOneHot(context.metrics.collect(), "readiness", "unhealthy");
-    expect(sampleValue(context.metrics.collect(), "nutsnews_worker_consumer_active", {
+    const consumerRestored = context.metrics.collect();
+    expect(sampleValue(consumerRestored, "nutsnews_worker_consumers", {
       queue: "nutsnews.worker.translation.v1"
     })).toBe(1);
+    expectHealthOneHot(consumerRestored, "readiness", "unhealthy");
 
     await expect(context.service.health.liveness()).resolves.toMatchObject({
       status: "ok"
@@ -355,16 +576,82 @@ describe("translation lifecycle telemetry", () => {
     await expect(context.service.health.readiness()).resolves.toMatchObject({
       status: "ok"
     });
-    expectHealthOneHot(context.metrics.collect(), "readiness", "ok");
+    const healthy = context.metrics.collect();
+    expectHealthOneHot(healthy, "readiness", "ok");
+    expect(healthy.match(/^# HELP nutsnews_worker_health_check /gmu)).toHaveLength(1);
+    expect(healthy.match(/^# TYPE nutsnews_worker_health_check gauge$/gmu)).toHaveLength(1);
+    expect(healthy.match(/^# HELP nutsnews_worker_health_check_duration_seconds /gmu)).toHaveLength(1);
+    expect(healthy.match(/^# TYPE nutsnews_worker_health_check_duration_seconds histogram$/gmu)).toHaveLength(1);
+    expect(healthy.split("\n").some((line) => line.startsWith("nutsnews_worker_health_check{")
+      && line.includes('check="broker-lifecycle"'))).toBe(true);
+    expect(healthy.split("\n").some((line) => line.startsWith("nutsnews_worker_health_check_duration_seconds_bucket{")
+      && line.includes('check="broker-lifecycle"'))).toBe(true);
+    expect(healthy).not.toContain('check="other"');
+    expect(healthChecksByProbe(healthy, "liveness")).toEqual(new Set([
+      "process"
+    ]));
+    expect(healthChecksByProbe(healthy, "startup")).toEqual(new Set([
+      "service-started"
+    ]));
+    expect(healthChecksByProbe(healthy, "readiness")).toEqual(new Set(
+      TRANSLATION_RUNTIME_HEALTH_CHECKS.filter((check) => check !== "process" && check !== "service-started")
+    ));
+    expect(allHealthChecks(healthy)).toEqual(new Set(TRANSLATION_RUNTIME_HEALTH_CHECKS));
 
-    await context.service.consumer?.cancel();
+    const qwenClient = context.dependencies.qwenClient as LocalTranslationQwenClient;
+    qwenClient.status = "unhealthy";
     await expect(context.service.health.readiness()).resolves.toMatchObject({
       status: "unhealthy"
     });
+    const dependencyFailure = context.metrics.collect();
+    expectHealthOneHot(dependencyFailure, "readiness", "unhealthy");
+    expect(sampleValue(dependencyFailure, "nutsnews_worker_health_check", {
+      check: "qwen-client",
+      outcome: "unhealthy",
+      probe: "readiness"
+    })).toBe(1);
+    expect(sampleValue(dependencyFailure, "nutsnews_worker_health_check", {
+      check: "rabbitmq-consumer",
+      outcome: "ok",
+      probe: "readiness"
+    })).toBe(1);
+
+    qwenClient.status = "ok";
+    await expect(context.service.health.readiness()).resolves.toMatchObject({
+      status: "ok"
+    });
+    const dependencyRecovered = context.metrics.collect();
+    expectHealthOneHot(dependencyRecovered, "readiness", "ok");
+    expect(sampleValue(dependencyRecovered, "nutsnews_worker_health_check", {
+      check: "qwen-client",
+      outcome: "ok",
+      probe: "readiness"
+    })).toBe(1);
+    expect(sampleValue(dependencyRecovered, "nutsnews_worker_health_check", {
+      check: "qwen-client",
+      outcome: "unhealthy",
+      probe: "readiness"
+    })).toBe(0);
+
+    await context.service.consumer?.cancel();
     const cancelled = context.metrics.collect();
     expectHealthOneHot(cancelled, "readiness", "unhealthy");
-    expect(sampleValue(cancelled, "nutsnews_worker_consumer_active", {
+    expect(sampleValue(cancelled, "nutsnews_worker_consumers", {
       queue: "nutsnews.worker.translation.v1"
+    })).toBe(0);
+    expect(sampleValue(cancelled, "nutsnews_worker_consumer_events_total", {
+      outcome: "inactive",
+      queue: "nutsnews.worker.translation.v1"
+    })).toBe(1);
+    expect(sampleValue(cancelled, "nutsnews_worker_health_check", {
+      check: "rabbitmq-consumer",
+      outcome: "unhealthy",
+      probe: "readiness"
+    })).toBe(1);
+    expect(sampleValue(cancelled, "nutsnews_worker_health_check", {
+      check: "rabbitmq-consumer",
+      outcome: "ok",
+      probe: "readiness"
     })).toBe(0);
 
     await context.service.stop();
@@ -372,6 +659,20 @@ describe("translation lifecycle telemetry", () => {
     expectHealthOneHot(stopped, "liveness", "ok");
     expectHealthOneHot(stopped, "startup", "unhealthy");
     expectHealthOneHot(stopped, "readiness", "unhealthy");
+    expect(sampleValue(stopped, "nutsnews_worker_health_check", {
+      check: "service-started",
+      outcome: "unhealthy",
+      probe: "startup"
+    })).toBe(1);
+    expect(sampleValue(stopped, "nutsnews_worker_health_check", {
+      check: "broker-lifecycle",
+      outcome: "unhealthy",
+      probe: "readiness"
+    })).toBe(1);
+    expect(sampleValue(stopped, "nutsnews_worker_consumer_events_total", {
+      outcome: "inactive",
+      queue: "nutsnews.worker.translation.v1"
+    })).toBe(1);
   });
 
   it("keeps synchronous and rejected telemetry best-effort without changing exact-one delivery outcomes", async () => {
@@ -418,10 +719,10 @@ describe("translation lifecycle telemetry", () => {
       setShutdownDraining: () => {
         throw new Error("metrics unavailable");
       },
-      setConsumerActive: () => {
+      setExpectedActive: () => {
         throw new Error("metrics unavailable");
       },
-      setHealthProbe: () => {
+      setLastSuccessTimestamp: () => {
         throw new Error("metrics unavailable");
       }
     };
@@ -472,6 +773,7 @@ describe("translation lifecycle telemetry", () => {
         environment: "test",
         host: "translation-test"
       },
+      expectedActive: false,
       allowedLanguages: [
         "fr",
         ...untrustedLanguages
@@ -526,14 +828,15 @@ describe("translation lifecycle telemetry", () => {
     ]);
   });
 
-  it("does not manufacture dependency samples for duration-less or zero-duration startup events", async () => {
+  it("delegates measured zero-duration dependencies to Runtime without manufacturing duration-less samples", async () => {
     const metrics = createTranslationPrometheusMetricsSink({
       identity: {
         service: "nutsnews-worker-article-translation",
         version: "0.1.0",
         environment: "test",
         host: "translation-test"
-      }
+      },
+      expectedActive: false
     });
 
     await metrics.emit({
@@ -562,7 +865,15 @@ describe("translation lifecycle telemetry", () => {
       }
     });
 
-    expect(metrics.collect()).not.toContain("nutsnews_worker_dependency_duration_ms");
+    const output = metrics.collect();
+
+    expect(sampleValue(output, "nutsnews_worker_dependency_duration_seconds_count", {
+      dependency: "translation-shell"
+    })).toBe(1);
+    expect(sampleValue(output, "nutsnews_worker_dependency_duration_seconds_sum", {
+      dependency: "translation-shell"
+    })).toBe(0);
+    expect(output).not.toContain("nutsnews_worker_dependency_duration_ms");
   });
 });
 
@@ -582,6 +893,7 @@ function createTelemetryContext() {
       environment: config.environment,
       host: config.host
     },
+    expectedActive: !config.shadowMode,
     allowedLanguages: config.languagePolicy.targetLanguages
   });
   const service = createTranslationService({
@@ -701,6 +1013,47 @@ function idempotencyKey(sequence: number): string {
   return `approval:translation:telemetry-${String(sequence)}`;
 }
 
+interface Deferred<T> {
+  readonly promise: Promise<T>;
+  resolve(value: T): void;
+}
+
+function deferred<T>(): Deferred<T> {
+  let resolvePromise: ((value: T) => void) | undefined;
+  const promise = new Promise<T>((resolve) => {
+    resolvePromise = resolve;
+  });
+
+  return {
+    promise,
+    resolve(value: T): void {
+      if (resolvePromise === undefined) {
+        throw new Error("Deferred promise resolver is unavailable.");
+      }
+
+      resolvePromise(value);
+    }
+  };
+}
+
+function translationCompletionEvent(
+  name: "runtime.message.accepted" | "runtime.message.duplicate",
+  at: string,
+  attributes?: Readonly<Record<string, unknown>>
+): RuntimeTelemetryEvent {
+  return {
+    name,
+    level: "info",
+    at,
+    stage: "translation",
+    queue: "nutsnews.worker.translation.v1",
+    outcome: name === "runtime.message.accepted" ? "success" : "duplicate",
+    ...(attributes === undefined ? {} : {
+      attributes
+    })
+  };
+}
+
 function metricValue(output: string, metric: string, outcome: string): number {
   const matches = output
     .split("\n")
@@ -734,6 +1087,22 @@ function histogramBoundaries(output: string): readonly string[] {
     .split("\n")
     .filter((line) => line.startsWith("nutsnews_worker_uplift_stage_latency_seconds_bucket{"))
     .map((line) => /le="([^"]+)"/u.exec(line)?.[1] ?? "");
+}
+
+function allHealthChecks(output: string): ReadonlySet<string> {
+  return healthChecks(output);
+}
+
+function healthChecksByProbe(output: string, probe: "liveness" | "startup" | "readiness"): ReadonlySet<string> {
+  return healthChecks(output, probe);
+}
+
+function healthChecks(output: string, probe?: "liveness" | "startup" | "readiness"): ReadonlySet<string> {
+  return new Set(output
+    .split("\n")
+    .filter((line) => line.startsWith("nutsnews_worker_health_check{"))
+    .filter((line) => probe === undefined || line.includes(`probe="${probe}"`))
+    .map((line) => /check="([^"]+)"/u.exec(line)?.[1] ?? ""));
 }
 
 function expectHealthOneHot(

@@ -81,6 +81,15 @@ describe("loadTranslationConfig", () => {
     }
   });
 
+  it("rejects in-memory dependency mode for the production environment", () => {
+    expect(() => loadTranslationConfig({
+      NUTSNEWS_ENVIRONMENT: "production",
+      NUTSNEWS_TRANSLATION_DEPENDENCY_MODE: "test"
+    })).toThrow(
+      "NUTSNEWS_TRANSLATION_DEPENDENCY_MODE must be production when NUTSNEWS_ENVIRONMENT=production."
+    );
+  });
+
   it("rejects unsafe concurrency bounds and shadow cutover in this repo", () => {
     expect(() => loadTranslationConfig({
       NUTSNEWS_TRANSLATION_CONCURRENCY: "8",

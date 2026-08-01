@@ -19,6 +19,7 @@ import {
   type RuntimeClock,
   type RuntimeHandlerResult,
   type RuntimeIdempotencyClaimContext,
+  type RuntimeIdempotencyClaimReleaseResult,
   type RuntimeIdempotencyClaimResult,
   type RuntimeIdempotencyCompletion,
   type RuntimeIdempotencyFailure,
@@ -95,6 +96,13 @@ export class InMemoryTranslationStateStore implements TranslationStateStore {
     return this.store.markFailed(idempotencyKey, failure);
   }
 
+  releaseClaim(
+    idempotencyKey: string,
+    failure: RuntimeIdempotencyFailure
+  ): Promise<RuntimeIdempotencyClaimReleaseResult> {
+    return this.store.releaseClaim(idempotencyKey, failure);
+  }
+
   findLanguageResult(key: TranslationLanguageResultKey, transaction: TranslationDatabaseTransaction): Promise<TranslationStoredLanguageResult | undefined> {
     void transaction;
     return Promise.resolve(this.languageResults.find((result) => languageResultMatches(result, key)));
@@ -149,14 +157,21 @@ export class LocalTranslationTransactionRunner implements TranslationDatabaseTra
     };
   }
 
-  async withTransaction<T>(operation: (transaction: TranslationDatabaseTransaction) => Promise<T>): Promise<T> {
+  async withTransaction<T>(
+    operation: (transaction: TranslationDatabaseTransaction) => Promise<T>,
+    signal?: AbortSignal
+  ): Promise<T> {
+    signal?.throwIfAborted();
     const transaction = {
       transactionId: `local-transaction-${String(this.transactions.length + 1)}`
     };
 
     this.transactions.push(transaction);
 
-    return operation(transaction);
+    const value = await operation(transaction);
+    signal?.throwIfAborted();
+
+    return value;
   }
 }
 
@@ -198,6 +213,7 @@ export class LocalTranslationQwenClient implements TranslationQwenClient {
   }
 
   translate(request: TranslationQwenRequest): Promise<unknown> {
+    request.signal?.throwIfAborted();
     this.requests.push(request);
 
     const languageError = this.errorsByLanguage.get(request.input.targetLanguage);
@@ -351,13 +367,48 @@ export class LocalTranslationWorkHandler implements TranslationWorkHandler {
   handleGate: Promise<unknown> | undefined;
   onHandleStart: (() => void) | undefined;
 
-  async handle(context: RuntimeMessageContext, tools: TranslationWorkTools): Promise<RuntimeHandlerResult> {
+  async handle(
+    context: RuntimeMessageContext,
+    tools: TranslationWorkTools,
+    signal: AbortSignal
+  ): Promise<RuntimeHandlerResult> {
     void tools;
+    signal.throwIfAborted();
     this.onHandleStart?.();
-    await this.handleGate;
+    await waitForAbortable(this.handleGate, signal);
+    signal.throwIfAborted();
     this.handled.push(context);
 
     return this.result;
+  }
+}
+
+async function waitForAbortable(operation: Promise<unknown> | undefined, signal: AbortSignal): Promise<void> {
+  if (operation === undefined) {
+    return;
+  }
+
+  let onAbort: (() => void) | undefined;
+
+  try {
+    await Promise.race([
+      operation,
+      new Promise<never>((_, reject) => {
+        onAbort = () => {
+          reject(signal.reason instanceof Error
+            ? signal.reason
+            : new Error("Translation operation aborted."));
+        };
+        signal.addEventListener("abort", onAbort, {
+          once: true
+        });
+        signal.throwIfAborted();
+      })
+    ]);
+  } finally {
+    if (onAbort !== undefined) {
+      signal.removeEventListener("abort", onAbort);
+    }
   }
 }
 

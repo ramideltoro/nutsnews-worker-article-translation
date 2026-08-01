@@ -1,30 +1,21 @@
 import {
-  getRetryDestination,
-  getWorkerRoute,
-  validateStagePayload,
-  validateWorkerEnvelope,
-  type StagePayloadValidationIssue,
-  type WorkerMessageEnvelope
+  getWorkerRoute
 } from "@ramideltoro/nutsnews-worker-contracts";
 import {
   createBrokerLifecycle,
   createBrokerConsumerReadinessCheck,
   createRuntimeHealthProbeSet,
   createRuntimeInFlightDrainController,
+  createRuntimeMessageProcessor,
   emitRuntimeTelemetry,
   runtimeNow,
   type BrokerConsumerHandle,
   type BrokerLifecycle,
   type RuntimeHealthCheck,
-  type RuntimeHealthReport,
   type RuntimeHealthProbeSet,
-  type RuntimeIdempotencyClaimResult,
-  type RuntimeIdempotencyStore,
-  type RuntimeMessageContext,
   type RuntimeMessageDelivery,
   type RuntimeMessageProcessingResult,
-  type RuntimeTelemetrySink,
-  type RuntimeValidationIssue
+  type RuntimeTelemetrySink
 } from "@ramideltoro/nutsnews-worker-runtime";
 
 import type { TranslationConfig } from "./config.js";
@@ -33,15 +24,15 @@ import type {
   TranslationDependencyProbe
 } from "./dependencies.js";
 import type {
-  TranslationHealthOutcome,
-  TranslationHealthProbe,
-  TranslationPrometheusMetricsSink,
   TranslationRuntimeMetricsSink
 } from "./metrics.js";
+import { withTranslationPublishSignal } from "./production.js";
 import {
   bestEffortTelemetrySink,
   runTelemetryBestEffort
 } from "./telemetry.js";
+
+export const TRANSLATION_PROCESSING_DEADLINE_MS = 210_000;
 
 export interface TranslationServiceOptions {
   readonly config: TranslationConfig;
@@ -79,21 +70,52 @@ export function createTranslationService(options: TranslationServiceOptions): Tr
   const drain = createRuntimeInFlightDrainController({
     timeoutMs: options.config.shutdownTimeoutMs
   });
-  const processor = createTranslationInputProcessor({
-    dependencies: options.dependencies,
+  const processor = createRuntimeMessageProcessor({
+    stage: "translation",
+    idempotencyStore: options.dependencies.stateStore,
+    clock: options.dependencies.clock,
     ...(telemetry === undefined ? {} : {
       telemetry
     }),
     handler: async (context) => {
+      const deadlineController = new AbortController();
+      const deadline = setTimeout(() => {
+        const error = new Error("Translation processing deadline exceeded.");
+        error.name = "TimeoutError";
+        deadlineController.abort(error);
+      }, TRANSLATION_PROCESSING_DEADLINE_MS);
+      deadline.unref();
+      const signal = deadlineController.signal;
+
       try {
         return await drain.track(async () => {
-          setInFlight(options.metrics, translationRoute.mainQueue.name, drain.inFlight);
+          signal.throwIfAborted();
           const dependencyStartedAtMs = options.dependencies.clock.now().getTime();
           const result = await options.dependencies.workHandler.handle(context, {
-            publish: (command) => broker.publish(command),
-            recordOutbox: (command, receipt) => options.dependencies.brokerOutbox.record(command, receipt),
-            withTransaction: (operation) => options.dependencies.transactionRunner.withTransaction(operation)
-          });
+            publish: async (command) => {
+              signal.throwIfAborted();
+              const receipt = await broker.publish(withTranslationPublishSignal(command, signal));
+              signal.throwIfAborted();
+
+              return receipt;
+            },
+            recordOutbox: async (command, receipt) => {
+              signal.throwIfAborted();
+              await options.dependencies.brokerOutbox.record(command, receipt);
+              signal.throwIfAborted();
+            },
+            withTransaction: async (operation) => {
+              signal.throwIfAborted();
+              const value = await options.dependencies.transactionRunner.withTransaction(
+                operation,
+                signal
+              );
+              signal.throwIfAborted();
+
+              return value;
+            }
+          }, signal);
+          signal.throwIfAborted();
 
           await emitRuntimeTelemetry(telemetry, {
             name: "runtime.dependency.observed",
@@ -113,19 +135,33 @@ export function createTranslationService(options: TranslationServiceOptions): Tr
           return result;
         });
       } finally {
-        setInFlight(options.metrics, translationRoute.mainQueue.name, drain.inFlight);
+        clearTimeout(deadline);
       }
     }
   });
   let started = false;
   let consumer: BrokerConsumerHandle | undefined;
+  let transportEmitsConsumerTelemetry = false;
+  let lastFallbackConsumerState: string | undefined;
+  const emitFallbackConsumerState = async (
+    status: ReturnType<BrokerLifecycle["consumerStatus"]>
+  ): Promise<void> => {
+    const state = `${status.state}:${String(status.activeConsumers)}`;
+
+    if (state === lastFallbackConsumerState) {
+      return;
+    }
+
+    await emitConsumerStateBestEffort(telemetry, options.dependencies, status);
+    lastFallbackConsumerState = state;
+  };
 
   const service = {
     get broker(): BrokerLifecycle {
       return broker;
     },
     get health(): RuntimeHealthProbeSet {
-      const probes = createRuntimeHealthProbeSet({
+      return createRuntimeHealthProbeSet({
         livenessChecks: [
           livenessCheck()
         ],
@@ -149,8 +185,6 @@ export function createTranslationService(options: TranslationServiceOptions): Tr
           telemetry
         })
       });
-
-      return observeHealthProbes(probes, options.metrics);
     },
     get isStarted(): boolean {
       return started;
@@ -168,22 +202,32 @@ export function createTranslationService(options: TranslationServiceOptions): Tr
 
       await broker.start();
       const brokerConsumer = await broker.consume("translation", processor);
+      const consumerStatus = broker.consumerStatus("translation");
+      transportEmitsConsumerTelemetry = consumerStatus.reason !== "transport-status-unavailable";
+
+      if (!transportEmitsConsumerTelemetry) {
+        await emitFallbackConsumerState(consumerStatus);
+      }
+
       consumer = {
         stage: brokerConsumer.stage,
         cancel: async () => {
           await brokerConsumer.cancel();
-          setConsumerActive(options.metrics, 0);
-          setHealthProbe(options.metrics, "readiness", "unhealthy");
+
+          if (!transportEmitsConsumerTelemetry) {
+            await emitFallbackConsumerState(broker.consumerStatus("translation"));
+          }
+
+          await refreshHealthBestEffort(() => service.health.readiness());
         }
       };
       started = true;
-      setConsumerActive(options.metrics, 1);
-      setHealthProbe(options.metrics, "startup", "ok");
-      setInFlight(options.metrics, translationRoute.mainQueue.name, drain.inFlight);
-      await refreshReadinessBestEffort(
-        () => service.health.readiness(),
-        options.metrics
-      );
+      await refreshHealthBestEffort(async () => {
+        await Promise.all([
+          service.health.startup(),
+          service.health.readiness()
+        ]);
+      });
     },
     async stop(): Promise<void> {
       if (!started && broker.state === "closed") {
@@ -194,13 +238,20 @@ export function createTranslationService(options: TranslationServiceOptions): Tr
       setShutdownDraining(options.metrics, true);
       await drain.waitForDrain(options.config.shutdownTimeoutMs);
       await broker.stop("shutdown");
-      setShutdownDraining(options.metrics, false);
-      setInFlight(options.metrics, translationRoute.mainQueue.name, drain.inFlight);
-      setConsumerActive(options.metrics, 0);
-      setHealthProbe(options.metrics, "startup", "unhealthy");
-      setHealthProbe(options.metrics, "readiness", "unhealthy");
+
+      if (!transportEmitsConsumerTelemetry) {
+        await emitFallbackConsumerState(broker.consumerStatus("translation"));
+      }
+
       consumer = undefined;
       started = false;
+      setShutdownDraining(options.metrics, false);
+      await refreshHealthBestEffort(async () => {
+        await Promise.all([
+          service.health.startup(),
+          service.health.readiness()
+        ]);
+      });
     },
     processDelivery(delivery: RuntimeMessageDelivery): Promise<RuntimeMessageProcessingResult> {
       return processor(delivery);
@@ -210,33 +261,6 @@ export function createTranslationService(options: TranslationServiceOptions): Tr
   return service;
 }
 
-function setConsumerActive(
-  metrics: TranslationRuntimeMetricsSink | undefined,
-  activeConsumers: number
-): void {
-  if (isTranslationMetrics(metrics)) {
-    runTelemetryBestEffort(() => metrics.setConsumerActive(activeConsumers));
-  }
-}
-
-function setHealthProbe(
-  metrics: TranslationRuntimeMetricsSink | undefined,
-  probe: TranslationHealthProbe,
-  outcome: TranslationHealthOutcome
-): void {
-  if (isTranslationMetrics(metrics)) {
-    runTelemetryBestEffort(() => metrics.setHealthProbe(probe, outcome));
-  }
-}
-
-function setInFlight(
-  metrics: TranslationRuntimeMetricsSink | undefined,
-  queue: string,
-  value: number
-): void {
-  runTelemetryBestEffort(() => metrics?.setInFlight(queue, value));
-}
-
 function setShutdownDraining(
   metrics: TranslationRuntimeMetricsSink | undefined,
   draining: boolean
@@ -244,320 +268,34 @@ function setShutdownDraining(
   runTelemetryBestEffort(() => metrics?.setShutdownDraining(draining));
 }
 
-function observeHealthProbes(
-  probes: RuntimeHealthProbeSet,
-  metrics: TranslationRuntimeMetricsSink | undefined
-): RuntimeHealthProbeSet {
-  const observe = async <T extends RuntimeHealthReport>(
-    probe: TranslationHealthProbe,
-    operation: () => Promise<T>
-  ): Promise<T> => {
-    const report = await operation();
-    setHealthProbe(metrics, probe, report.status);
-
-    return report;
-  };
-
-  return {
-    liveness: () => observe("liveness", () => probes.liveness()),
-    startup: () => observe("startup", () => probes.startup()),
-    readiness: () => observe("readiness", () => probes.readiness())
-  };
-}
-
-async function refreshReadinessBestEffort(
-  operation: () => Promise<RuntimeHealthReport>,
-  metrics: TranslationRuntimeMetricsSink | undefined
+async function refreshHealthBestEffort(
+  operation: () => Promise<unknown>
 ): Promise<void> {
   try {
     await operation();
   } catch {
-    setHealthProbe(metrics, "readiness", "unhealthy");
+    // Health evaluation is observational and must not change lifecycle outcomes.
   }
 }
 
-function isTranslationMetrics(
-  metrics: TranslationRuntimeMetricsSink | undefined
-): metrics is TranslationPrometheusMetricsSink {
-  return metrics !== undefined
-    && "setConsumerActive" in metrics
-    && typeof metrics.setConsumerActive === "function"
-    && "setHealthProbe" in metrics
-    && typeof metrics.setHealthProbe === "function";
-}
-
-interface TranslationInputProcessorOptions {
-  readonly dependencies: TranslationDependencies;
-  readonly telemetry?: RuntimeTelemetrySink;
-  handler(context: RuntimeMessageContext): Promise<{ readonly status: "ok" } | { readonly status: "retry"; readonly reason: string; readonly retryAfterMs?: number } | { readonly status: "terminal-failure"; readonly reason: string }>;
-}
-
-function createTranslationInputProcessor(options: TranslationInputProcessorOptions) {
-  return async (delivery: RuntimeMessageDelivery): Promise<RuntimeMessageProcessingResult> => {
-    const receivedAt = delivery.receivedAt ?? runtimeNow(options.dependencies.clock);
-    const startedAtMs = options.dependencies.clock.now().getTime();
-    const queue = getWorkerRoute("translation").mainQueue.name;
-    await emitRuntimeTelemetry(options.telemetry, {
-      name: "runtime.message.started",
-      level: "info",
-      at: runtimeNow(options.dependencies.clock),
-      stage: "translation",
-      queue,
-      outcome: "started"
-    });
-
-    const envelopeResult = validateWorkerEnvelope(delivery.envelope);
-
-    if (!envelopeResult.ok) {
-      const issues = envelopeResult.issues.map(toRuntimeValidationIssue);
-      await emitInvalid(
-        options.telemetry,
-        undefined,
-        issues,
-        options.dependencies.clock,
-        queue,
-        elapsedMs(options.dependencies.clock, startedAtMs)
-      );
-
-      return {
-        action: "dlq",
-        reason: "invalid-envelope",
-        issues
-      };
+async function emitConsumerStateBestEffort(
+  telemetry: RuntimeTelemetrySink | undefined,
+  dependencies: TranslationDependencies,
+  status: ReturnType<BrokerLifecycle["consumerStatus"]>
+): Promise<void> {
+  await emitRuntimeTelemetry(telemetry, {
+    name: "runtime.broker.consumer_state_changed",
+    level: status.activeConsumers > 0 ? "info" : "error",
+    at: runtimeNow(dependencies.clock),
+    stage: status.stage,
+    queue: status.queue,
+    outcome: status.state,
+    attributes: {
+      activeConsumers: status.activeConsumers,
+      state: status.state,
+      reason: status.reason
     }
-
-    const envelope = envelopeResult.value;
-
-    if (envelope.route !== "translation") {
-      const issues = [
-        {
-          path: "$.route",
-          code: "stage-mismatch",
-          message: `Envelope route ${envelope.route} does not match processor stage translation.`
-        }
-      ];
-      await emitInvalid(
-        options.telemetry,
-        envelope,
-        issues,
-        options.dependencies.clock,
-        queue,
-        elapsedMs(options.dependencies.clock, startedAtMs)
-      );
-
-      return terminalResult(envelope, "stage-mismatch", issues);
-    }
-
-    const payloadResult = validateStagePayload(delivery.payload);
-
-    if (!payloadResult.ok) {
-      const issues = payloadResult.issues.map(toRuntimeValidationIssue);
-      await emitInvalid(
-        options.telemetry,
-        envelope,
-        issues,
-        options.dependencies.clock,
-        queue,
-        elapsedMs(options.dependencies.clock, startedAtMs)
-      );
-
-      return terminalResult(envelope, "invalid-payload", issues);
-    }
-
-    if (payloadResult.definition.consumer !== "translation") {
-      const issues = [
-        {
-          path: "$.schemaId",
-          code: "payload-consumer-mismatch",
-          message: `Payload schema consumer ${payloadResult.definition.consumer} does not match translation.`
-        }
-      ];
-      await emitInvalid(
-        options.telemetry,
-        envelope,
-        issues,
-        options.dependencies.clock,
-        queue,
-        elapsedMs(options.dependencies.clock, startedAtMs)
-      );
-
-      return terminalResult(envelope, "payload-consumer-mismatch", issues);
-    }
-
-    let claim: RuntimeIdempotencyClaimResult;
-
-    try {
-      claim = await options.dependencies.stateStore.claim(envelope.idempotencyKey, {
-        envelope,
-        stage: "translation",
-        receivedAt
-      });
-    } catch {
-      return completeWithRetryOrDlq(
-        options.telemetry,
-        envelope,
-        "idempotency-claim-error",
-        options.dependencies.clock,
-        queue,
-        elapsedMs(options.dependencies.clock, startedAtMs)
-      );
-    }
-
-    if (claim.status === "already-completed") {
-      await emitRuntimeTelemetry(options.telemetry, {
-        name: "runtime.message.duplicate",
-        level: "info",
-        at: runtimeNow(options.dependencies.clock),
-        stage: "translation",
-        ...envelopeTelemetryFields(envelope, queue, elapsedMs(options.dependencies.clock, startedAtMs)),
-        outcome: "duplicate",
-        attributes: {
-          firstSeenAt: claim.firstSeenAt,
-          completedAt: claim.completedAt
-        }
-      });
-
-      return {
-        action: "ack",
-        reason: "duplicate",
-        envelope
-      };
-    }
-
-    if (claim.status === "in-progress") {
-      const result = retryOrDlq(envelope, "idempotency-in-progress", 1_000);
-      await emitRetryOrDlq(
-        options.telemetry,
-        result,
-        options.dependencies.clock,
-        queue,
-        elapsedMs(options.dependencies.clock, startedAtMs)
-      );
-
-      return result;
-    }
-
-    const context: RuntimeMessageContext = {
-      envelope,
-      payload: payloadResult.value,
-      stage: "translation",
-      receivedAt
-    };
-
-    let result: Awaited<ReturnType<TranslationInputProcessorOptions["handler"]>>;
-
-    try {
-      result = await options.handler(context);
-    } catch (error: unknown) {
-      try {
-        await markFailed(options.dependencies.stateStore, envelope, classifyHandlerError(error), true, options.dependencies.clock);
-      } catch {
-        return completeWithRetryOrDlq(
-          options.telemetry,
-          envelope,
-          "idempotency-mark-failed-error",
-          options.dependencies.clock,
-          queue,
-          elapsedMs(options.dependencies.clock, startedAtMs)
-        );
-      }
-
-      return completeWithRetryOrDlq(
-        options.telemetry,
-        envelope,
-        "handler-error",
-        options.dependencies.clock,
-        queue,
-        elapsedMs(options.dependencies.clock, startedAtMs)
-      );
-    }
-
-    if (result.status === "ok") {
-      try {
-        await markCompleted(options.dependencies.stateStore, envelope, options.dependencies.clock);
-      } catch {
-        await markFailedBestEffort(
-          options.dependencies.stateStore,
-          envelope,
-          "idempotency-mark-completed-error",
-          options.dependencies.clock
-        );
-
-        return completeWithRetryOrDlq(
-          options.telemetry,
-          envelope,
-          "idempotency-mark-completed-error",
-          options.dependencies.clock,
-          queue,
-          elapsedMs(options.dependencies.clock, startedAtMs)
-        );
-      }
-
-      await emitRuntimeTelemetry(options.telemetry, {
-        name: "runtime.message.accepted",
-        level: "info",
-        at: runtimeNow(options.dependencies.clock),
-        stage: "translation",
-        ...envelopeTelemetryFields(envelope, queue, elapsedMs(options.dependencies.clock, startedAtMs)),
-        outcome: "success"
-      });
-
-      return {
-        action: "ack",
-        reason: "handled",
-        envelope
-      };
-    }
-
-    if (result.status === "retry") {
-      try {
-        await markFailed(options.dependencies.stateStore, envelope, result.reason, true, options.dependencies.clock);
-      } catch {
-        return completeWithRetryOrDlq(
-          options.telemetry,
-          envelope,
-          "idempotency-mark-failed-error",
-          options.dependencies.clock,
-          queue,
-          elapsedMs(options.dependencies.clock, startedAtMs)
-        );
-      }
-
-      return completeWithRetryOrDlq(
-        options.telemetry,
-        envelope,
-        result.reason,
-        options.dependencies.clock,
-        queue,
-        elapsedMs(options.dependencies.clock, startedAtMs),
-        result.retryAfterMs
-      );
-    }
-
-    try {
-      await markFailed(options.dependencies.stateStore, envelope, result.reason, false, options.dependencies.clock);
-    } catch {
-      return completeWithRetryOrDlq(
-        options.telemetry,
-        envelope,
-        "idempotency-mark-failed-error",
-        options.dependencies.clock,
-        queue,
-        elapsedMs(options.dependencies.clock, startedAtMs)
-      );
-    }
-
-    const processingResult = terminalResult(envelope, result.reason);
-    await emitRetryOrDlq(
-      options.telemetry,
-      processingResult,
-      options.dependencies.clock,
-      queue,
-      elapsedMs(options.dependencies.clock, startedAtMs)
-    );
-
-    return processingResult;
-  };
+  });
 }
 
 function livenessCheck(): RuntimeHealthCheck {
@@ -635,240 +373,6 @@ function shadowModeCheck(config: TranslationConfig): RuntimeHealthCheck {
   };
 }
 
-function retryOrDlq(
-  envelope: WorkerMessageEnvelope,
-  reason: string,
-  retryAfterMs?: number
-): RuntimeMessageProcessingResult {
-  const destination = getRetryDestination(envelope.route, envelope.attempt.count);
-
-  if ("ttlMs" in destination) {
-    if (retryAfterMs === undefined) {
-      return {
-        action: "retry",
-        reason,
-        envelope,
-        destination
-      };
-    }
-
-    return {
-      action: "retry",
-      reason,
-      envelope,
-      destination,
-      retryAfterMs
-    };
-  }
-
-  return {
-    action: "dlq",
-    reason,
-    envelope,
-    destination
-  };
-}
-
-function terminalResult(
-  envelope: WorkerMessageEnvelope,
-  reason: string,
-  issues?: readonly RuntimeValidationIssue[]
-): RuntimeMessageProcessingResult {
-  const destination = getRetryDestination(envelope.route, envelope.attempt.max);
-
-  if (issues === undefined) {
-    return {
-      action: "dlq",
-      reason,
-      envelope,
-      destination
-    };
-  }
-
-  return {
-    action: "dlq",
-    reason,
-    envelope,
-    destination,
-    issues
-  };
-}
-
-function toRuntimeValidationIssue(issue: StagePayloadValidationIssue | RuntimeValidationIssue): RuntimeValidationIssue {
-  return {
-    path: issue.path,
-    code: issue.code,
-    message: issue.message
-  };
-}
-
-async function markCompleted(
-  store: RuntimeIdempotencyStore,
-  envelope: WorkerMessageEnvelope,
-  clock: TranslationDependencies["clock"]
-): Promise<void> {
-  await store.markCompleted(envelope.idempotencyKey, {
-    completedAt: runtimeNow(clock),
-    messageId: envelope.messageId,
-    stage: "translation"
-  });
-}
-
-async function markFailed(
-  store: RuntimeIdempotencyStore,
-  envelope: WorkerMessageEnvelope,
-  reason: string,
-  retryable: boolean,
-  clock: TranslationDependencies["clock"]
-): Promise<void> {
-  await store.markFailed(envelope.idempotencyKey, {
-    failedAt: runtimeNow(clock),
-    messageId: envelope.messageId,
-    stage: "translation",
-    reason,
-    retryable
-  });
-}
-
-async function markFailedBestEffort(
-  store: RuntimeIdempotencyStore,
-  envelope: WorkerMessageEnvelope,
-  reason: string,
-  clock: TranslationDependencies["clock"]
-): Promise<void> {
-  try {
-    await markFailed(store, envelope, reason, true, clock);
-  } catch {
-    // The delivery still follows the bounded retry/DLQ path below.
-  }
-}
-
-async function completeWithRetryOrDlq(
-  telemetry: RuntimeTelemetrySink | undefined,
-  envelope: WorkerMessageEnvelope,
-  reason: string,
-  clock: TranslationDependencies["clock"],
-  queue: string,
-  durationMs: number,
-  retryAfterMs?: number
-): Promise<RuntimeMessageProcessingResult> {
-  const processingResult = retryOrDlq(envelope, reason, retryAfterMs);
-  await emitRetryOrDlq(telemetry, processingResult, clock, queue, durationMs);
-
-  return processingResult;
-}
-
-function classifyHandlerError(error: unknown): string {
-  if (error instanceof Error && error.name.length > 0) {
-    return error.name;
-  }
-
-  return "unknown-handler-error";
-}
-
-async function emitInvalid(
-  telemetry: RuntimeTelemetrySink | undefined,
-  envelope: WorkerMessageEnvelope | undefined,
-  issues: readonly RuntimeValidationIssue[],
-  clock: TranslationDependencies["clock"],
-  queue: string,
-  durationMs: number
-): Promise<void> {
-  const firstIssue = issues[0];
-  const attributes = firstIssue === undefined
-    ? undefined
-    : {
-        issueCode: firstIssue.code,
-        issuePath: firstIssue.path
-      };
-
-  await emitRuntimeTelemetry(telemetry, {
-    name: "runtime.message.invalid",
-    level: "warn",
-    at: runtimeNow(clock),
-    stage: "translation",
-    queue,
-    durationMs,
-    outcome: "failure",
-    ...(envelope === undefined
-      ? {}
-      : envelopeTelemetryFields(envelope, queue, durationMs)),
-    ...(attributes === undefined
-      ? {}
-      : {
-          attributes
-        })
-  });
-}
-
-async function emitRetryOrDlq(
-  telemetry: RuntimeTelemetrySink | undefined,
-  result: RuntimeMessageProcessingResult,
-  clock: TranslationDependencies["clock"],
-  queue: string,
-  durationMs: number
-): Promise<void> {
-  if (result.action === "retry") {
-    await emitRuntimeTelemetry(telemetry, {
-      name: "runtime.message.retry",
-      level: "warn",
-      at: runtimeNow(clock),
-      stage: "translation",
-      ...envelopeTelemetryFields(result.envelope, queue, durationMs),
-      outcome: "retry",
-      attributes: {
-        reason: result.reason,
-        destination: result.destination.name
-      }
-    });
-
-    return;
-  }
-
-  if (result.action === "dlq") {
-    await emitRuntimeTelemetry(telemetry, {
-      name: "runtime.message.dlq",
-      level: "error",
-      at: runtimeNow(clock),
-      stage: "translation",
-      ...(result.envelope === undefined
-        ? {}
-        : envelopeTelemetryFields(result.envelope, queue, durationMs)),
-      outcome: "dlq",
-      attributes: {
-        reason: result.reason,
-        destination: result.destination?.name ?? "unroutable"
-      }
-    });
-  }
-}
-
 function elapsedMs(clock: TranslationDependencies["clock"], startedAtMs: number): number {
   return Math.max(0, clock.now().getTime() - startedAtMs);
-}
-
-function envelopeTelemetryFields(
-  envelope: WorkerMessageEnvelope,
-  queue: string,
-  durationMs: number
-): Readonly<Record<string, string | number>> {
-  const base = {
-    messageId: envelope.messageId,
-    correlationId: envelope.correlationId,
-    causationId: envelope.causationId,
-    traceparent: envelope.traceparent,
-    idempotencyKey: envelope.idempotencyKey,
-    queue,
-    attempt: envelope.attempt.count,
-    durationMs
-  } as const;
-
-  if (envelope.tracestate === undefined) {
-    return base;
-  }
-
-  return {
-    ...base,
-    tracestate: envelope.tracestate
-  };
 }

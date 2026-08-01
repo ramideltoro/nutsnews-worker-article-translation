@@ -100,12 +100,19 @@ export class TranslationConfigError extends Error {
 export function loadTranslationConfig(env: NodeJS.ProcessEnv = process.env): TranslationConfig {
   const issues: string[] = [];
   const dependencyMode = parseDependencyMode(env.NUTSNEWS_TRANSLATION_DEPENDENCY_MODE, issues);
+  const environment = nonEmpty(env.NUTSNEWS_ENVIRONMENT, "local");
   const dependencies = {
     databaseConfigured: hasValue(env.NUTSNEWS_TRANSLATION_DATABASE_URL),
     rabbitmqConfigured: hasValue(env.NUTSNEWS_TRANSLATION_RABBITMQ_URL),
     qwenEndpointConfigured: hasValue(env.NUTSNEWS_TRANSLATION_QWEN_BASE_URL),
     qwenCredentialConfigured: hasValue(env.NUTSNEWS_TRANSLATION_QWEN_API_KEY)
   };
+
+  if (environment === "production" && dependencyMode !== "production") {
+    issues.push(
+      "NUTSNEWS_TRANSLATION_DEPENDENCY_MODE must be production when NUTSNEWS_ENVIRONMENT=production."
+    );
+  }
 
   if (dependencyMode === "production") {
     requireConfigured("NUTSNEWS_TRANSLATION_DATABASE_URL", dependencies.databaseConfigured, issues);
@@ -121,7 +128,7 @@ export function loadTranslationConfig(env: NodeJS.ProcessEnv = process.env): Tra
   const config: TranslationConfig = {
     serviceName: TRANSLATION_SERVICE_NAME,
     serviceVersion: TRANSLATION_SERVICE_VERSION,
-    environment: nonEmpty(env.NUTSNEWS_ENVIRONMENT, "local"),
+    environment,
     buildRevision,
     host: nonEmpty(env.HOSTNAME, os.hostname()),
     http: {

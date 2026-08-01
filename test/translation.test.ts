@@ -593,7 +593,8 @@ function createTranslationContext() {
       version: config.serviceVersion,
       environment: config.environment,
       host: config.host
-    }
+    },
+    expectedActive: !config.shadowMode
   });
   const telemetryAndMetrics = {
     emit: async (event: Parameters<typeof telemetry.emit>[0]) => {
