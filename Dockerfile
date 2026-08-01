@@ -6,6 +6,8 @@ COPY .npmrc package.json package-lock.json ./
 RUN --mount=type=secret,id=npm_token NODE_AUTH_TOKEN="$(cat /run/secrets/npm_token)" npm ci
 
 FROM dependencies AS build
+COPY Dockerfile ./Dockerfile
+COPY .github ./.github
 COPY tsconfig.json tsconfig.eslint.json eslint.config.js vitest.config.ts vitest.integration.config.ts ./
 COPY src ./src
 COPY test ./test
