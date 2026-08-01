@@ -284,6 +284,128 @@ describe("translation outbox reconciliation", () => {
     expect(replay?.envelope.causationId).toBe(command.envelope.causationId);
     expect(replay?.envelope.aggregate).toEqual(command.envelope.aggregate);
   });
+
+  it("reconstructs an authoritative persistence payload after JSONB reorders a complete carrier", async () => {
+    const result = storedResultSnapshot();
+    const command = legacyPersistenceCommand(result);
+    const pool = new FakePool([
+      {
+        ...outboxRow(command),
+        diagnostic_metadata: {
+          envelope: command.envelope,
+          payload: jsonbLikePersistencePayload(command.payload),
+          payloadSchemaId: command.payload.schemaId
+        }
+      }
+    ], [
+      {
+        result_snapshot: result
+      }
+    ]);
+    const transport = new FakeBrokerTransport();
+    const reconciler = new PostgresTranslationOutboxReconciler({
+      pool: pool.asPool(),
+      brokerTransport: transport,
+      clock,
+      env: {},
+      config: testConfig
+    });
+
+    const report = await reconciler.reconcile({
+      mode: "dry-run",
+      runId: "recovery-jsonb-order-persistence"
+    });
+
+    expect(report).toMatchObject({
+      status: "dry_run",
+      selectedCount: 1,
+      failedClosedCount: 0,
+      writesPerformed: false
+    });
+    expect(transport.published).toHaveLength(0);
+  });
+
+  it("reconstructs an authoritative status payload after JSONB reorders a complete carrier", async () => {
+    const result = storedResultSnapshot();
+    const command = legacyTranslationStatusCommand(
+      result,
+      "018f1598-2dd5-7c4f-9f92-8f7a7f8b3511",
+      jsonbOrderedSummaryRef(result.summaryRef)
+    );
+    const pool = new FakePool([
+      {
+        ...outboxRow(command),
+        diagnostic_metadata: {
+          envelope: command.envelope,
+          payload: jsonbLikeStatusPayload(command.payload),
+          payloadSchemaId: command.payload.schemaId
+        }
+      }
+    ], [
+      {
+        result_snapshot: result
+      }
+    ]);
+    const transport = new FakeBrokerTransport();
+    const reconciler = new PostgresTranslationOutboxReconciler({
+      pool: pool.asPool(),
+      brokerTransport: transport,
+      clock,
+      env: {},
+      config: testConfig
+    });
+
+    const report = await reconciler.reconcile({
+      mode: "dry-run",
+      runId: "recovery-jsonb-order-status"
+    });
+
+    expect(report).toMatchObject({
+      status: "dry_run",
+      selectedCount: 1,
+      failedClosedCount: 0,
+      writesPerformed: false
+    });
+    expect(transport.published).toHaveLength(0);
+  });
+
+  it("still fails closed when the authoritative translation payload digest is tampered", async () => {
+    const result = storedResultSnapshot();
+    const command = legacyPersistenceCommand(result);
+    const pool = new FakePool([
+      {
+        ...outboxRow(command),
+        payload_digest: `sha256:${"0".repeat(64)}`,
+        diagnostic_metadata: {
+          envelope: command.envelope,
+          payload: jsonbLikePersistencePayload(command.payload),
+          payloadSchemaId: command.payload.schemaId
+        }
+      }
+    ], [
+      {
+        result_snapshot: result
+      }
+    ]);
+    const transport = new FakeBrokerTransport();
+    const reconciler = new PostgresTranslationOutboxReconciler({
+      pool: pool.asPool(),
+      brokerTransport: transport,
+      clock,
+      env: {},
+      config: testConfig
+    });
+
+    const report = await reconciler.reconcile({
+      mode: "dry-run",
+      runId: "recovery-tampered-digest"
+    });
+
+    expect(report.status).toBe("failed_closed");
+    expect(report.errors).toContain("1:payload-digest-mismatch");
+    expect(report.writesPerformed).toBe(false);
+    expect(transport.published).toHaveLength(0);
+  });
 });
 
 const testConfig: TranslationConfig = {
