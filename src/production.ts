@@ -80,6 +80,7 @@ import {
   LocalTranslationQualityValidator,
   LocalTranslationWorkHandler
 } from "./test-doubles.js";
+import { bestEffortTelemetrySink } from "./telemetry.js";
 
 const TRANSLATION_SCHEMA = "worker_uplift_translation";
 const DEFAULT_PROMPT_VERSION = "0.1.0";
@@ -208,7 +209,7 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
     this.url = options.url;
     this.prefetchCount = options.prefetch;
     this.clock = options.clock;
-    this.telemetry = options.telemetry;
+    this.telemetry = bestEffortTelemetrySink(options.telemetry);
     this.connectToBroker = options.connect ?? amqpConnect;
   }
 

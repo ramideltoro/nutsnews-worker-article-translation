@@ -1,114 +1,416 @@
 import {
   createPrometheusRuntimeTelemetrySink,
-  type PrometheusRuntimeTelemetrySink,
   type PrometheusRuntimeTelemetrySinkOptions,
+  type RuntimeServiceIdentity,
   type RuntimeTelemetryEvent
 } from "@ramideltoro/nutsnews-worker-runtime";
 
-type TranslationMetricLabels = Readonly<Record<string, string>>;
+import {
+  emitTelemetryBestEffort,
+  runTelemetryBestEffort
+} from "./telemetry.js";
+
+type MetricLabels = Readonly<Record<string, string>>;
+
 interface TranslationMetricIdentity {
   readonly environment: string;
-  readonly host: string;
-  readonly service: string;
-  readonly version: string;
 }
 
-interface TranslationLanguageMetricDimensions {
-  readonly language: string;
-  readonly provider: string;
-  readonly result: string;
-  readonly retry: string;
+export interface TranslationRuntimeMetricIdentity extends RuntimeServiceIdentity {
+  readonly revision?: string;
+  readonly deployment?: "local" | "test" | "shadow" | "production" | "unknown";
+  readonly adapter?: "in_memory" | "mixed" | "production" | "unknown";
 }
 
-export interface TranslationPrometheusMetricsSink extends PrometheusRuntimeTelemetrySink {
+interface HistogramState {
+  readonly bucketCounts: number[];
+  count: number;
+  sum: number;
+}
+
+export interface TranslationPrometheusMetricsSinkOptions extends Omit<PrometheusRuntimeTelemetrySinkOptions, "identity"> {
+  readonly identity: TranslationRuntimeMetricIdentity;
+  readonly allowedLanguages?: readonly string[];
+}
+
+export interface TranslationRuntimeMetricsSink {
+  readonly allowedLabels: readonly string[];
+  emit(event: RuntimeTelemetryEvent): void | Promise<void>;
+  collect(): string;
+  setInFlight(queue: string, value: number): void;
+  setShutdownDraining(draining: boolean): void;
+}
+
+export interface TranslationPrometheusMetricsSink extends TranslationRuntimeMetricsSink {
+  readonly stageMetricLabels: readonly [
+    "environment",
+    "service",
+    "outcome"
+  ];
   readonly translationMetricLabels: readonly [
     "environment",
-    "host",
     "service",
-    "version",
+    "stage",
+    "outcome",
     "language",
-    "provider",
-    "result",
-    "retry"
+    "provider"
   ];
+  setConsumerActive(activeConsumers: number): void;
+  setHealthProbe(probe: TranslationHealthProbe, outcome: TranslationHealthOutcome): void;
 }
 
+export type TranslationHealthProbe = "liveness" | "startup" | "readiness";
+export type TranslationHealthOutcome = "ok" | "degraded" | "unhealthy";
+
+const TRANSLATION_STAGE = "translation";
+const TRANSLATION_QUEUE = "nutsnews.worker.translation.v1";
+const DEFAULT_LANGUAGES = [
+  "fr",
+  "ja",
+  "de-CH",
+  "de",
+  "el"
+] as const;
+const SUPPORTED_LANGUAGES = new Set<string>(DEFAULT_LANGUAGES);
+const ALLOWED_PROVIDERS = new Set([
+  "local_ai"
+]);
+const ALLOWED_OUTCOMES = new Set([
+  "success",
+  "duplicate",
+  "invalid",
+  "failure",
+  "retry",
+  "dlq"
+]);
+const COMPLETING_MESSAGE_EVENTS = new Set([
+  "runtime.message.accepted",
+  "runtime.message.duplicate",
+  "runtime.message.invalid",
+  "runtime.message.retry",
+  "runtime.message.dlq"
+]);
+const TRANSLATION_STAGE_OUTCOMES = [
+  "success",
+  "duplicate",
+  "invalid",
+  "retry",
+  "dlq"
+] as const;
+const HEALTH_PROBES = [
+  "liveness",
+  "startup",
+  "readiness"
+] as const satisfies readonly TranslationHealthProbe[];
+const HEALTH_OUTCOMES = [
+  "ok",
+  "degraded",
+  "unhealthy"
+] as const satisfies readonly TranslationHealthOutcome[];
+export const TRANSLATION_DURATION_BUCKETS_SECONDS = [
+  0.01,
+  0.05,
+  0.1,
+  0.25,
+  0.5,
+  1,
+  2.5,
+  5,
+  10,
+  30,
+  60,
+  120,
+  300
+] as const;
+
 export function createTranslationPrometheusMetricsSink(
-  options: PrometheusRuntimeTelemetrySinkOptions
+  options: TranslationPrometheusMetricsSinkOptions
 ): TranslationPrometheusMetricsSink {
   const runtimeMetrics = createPrometheusRuntimeTelemetrySink(options);
   const counters = new Map<string, Map<string, number>>();
-  const summaries = new Map<string, Map<string, { count: number; sum: number }>>();
+  const histograms = new Map<string, Map<string, HistogramState>>();
   const identity = {
-    environment: options.identity.environment,
-    host: options.identity.host ?? "unknown",
-    service: options.identity.service,
-    version: options.identity.version
+    environment: options.identity.environment
   };
+  initializeCanonicalStageMetrics(identity, counters, histograms);
+  const allowedLanguages = new Set(
+    (options.allowedLanguages ?? DEFAULT_LANGUAGES)
+      .filter((language) => SUPPORTED_LANGUAGES.has(language))
+  );
+  const health = new Map<TranslationHealthProbe, TranslationHealthOutcome>([
+    [
+      "liveness",
+      "ok"
+    ],
+    [
+      "startup",
+      "unhealthy"
+    ],
+    [
+      "readiness",
+      "unhealthy"
+    ]
+  ]);
+  let consumerActive = 0;
 
   return {
     get allowedLabels() {
       return runtimeMetrics.allowedLabels;
     },
+    stageMetricLabels: [
+      "environment",
+      "service",
+      "outcome"
+    ],
     translationMetricLabels: [
       "environment",
-      "host",
       "service",
-      "version",
+      "stage",
+      "outcome",
       "language",
-      "provider",
-      "result",
-      "retry"
+      "provider"
     ],
     async emit(event: RuntimeTelemetryEvent): Promise<void> {
-      await runtimeMetrics.emit(event);
-      observeTranslationLanguageEvent(event, identity, counters, summaries);
+      // Runtime 0.5 treats a duration-less dependency event as a zero-valued
+      // summary observation. Forward only measured dependency calls so the
+      // retained generic metrics do not manufacture latency samples.
+      if (shouldForwardToRuntimeMetrics(event)) {
+        await emitTelemetryBestEffort(runtimeMetrics, event);
+      }
+      runTelemetryBestEffort(() => recordHealthEvent(health, event));
+      runTelemetryBestEffort(() => {
+        consumerActive = consumerActiveFromEvent(event) ?? consumerActive;
+      });
+      runTelemetryBestEffort(() => recordConsumerReadinessEvent(health, event));
+      runTelemetryBestEffort(() => observeStageEvent(event, identity, counters, histograms));
+      runTelemetryBestEffort(() => observeTranslationLanguageEvent(event, identity, allowedLanguages, counters, histograms));
     },
     collect(): string {
-      return `${runtimeMetrics.collect()}${collectCustomMetrics(counters, summaries)}`;
-    },
-    recordDependencyLatency(queue, durationMs, outcome): void {
-      runtimeMetrics.recordDependencyLatency(queue, durationMs, outcome);
+      let runtimeOutput = "";
+
+      runTelemetryBestEffort(() => {
+        runtimeOutput = runtimeMetrics.collect();
+      });
+
+      return `${runtimeOutput}${collectCompatibilityIdentityMetrics(options, runtimeOutput)}${collectExpectedActiveMetric(identity)}${collectConsumerActiveMetric(identity, consumerActive)}${collectHealthProbeMetrics(identity, health)}${collectCustomMetrics(counters, histograms)}`;
     },
     setInFlight(queue, value): void {
-      runtimeMetrics.setInFlight(queue, value);
+      runTelemetryBestEffort(() => runtimeMetrics.setInFlight(queue, value));
     },
     setShutdownDraining(draining): void {
-      runtimeMetrics.setShutdownDraining(draining);
+      runTelemetryBestEffort(() => runtimeMetrics.setShutdownDraining(draining));
+    },
+    setConsumerActive(activeConsumers): void {
+      consumerActive = Math.max(0, Math.floor(activeConsumers));
+    },
+    setHealthProbe(probe, outcome): void {
+      health.set(probe, outcome);
     }
   };
+}
+
+function collectCompatibilityIdentityMetrics(
+  options: TranslationPrometheusMetricsSinkOptions,
+  runtimeOutput: string
+): string {
+  const identity = options.identity;
+  const environment = boundedLabel(identity.environment);
+  const service = boundedLabel(identity.service);
+  const lines: string[] = [];
+
+  if (!hasMetricFamily(runtimeOutput, "nutsnews_worker_build_info")) {
+    lines.push(
+      "# HELP nutsnews_worker_build_info Immutable worker build identity.",
+      "# TYPE nutsnews_worker_build_info gauge",
+      `nutsnews_worker_build_info${labelsKey({
+        environment,
+        service,
+        version: boundedLabel(identity.version),
+        revision: boundedLabel(identity.revision ?? "unknown")
+      })} 1`
+    );
+  }
+
+  if (!hasMetricFamily(runtimeOutput, "nutsnews_worker_deployment_info")) {
+    lines.push(
+      "# HELP nutsnews_worker_deployment_info Worker deployment ownership and dependency adapter identity.",
+      "# TYPE nutsnews_worker_deployment_info gauge",
+      `nutsnews_worker_deployment_info${labelsKey({
+        environment,
+        service,
+        deployment: boundedLabel(identity.deployment ?? "unknown"),
+        adapter: boundedLabel(identity.adapter ?? "unknown")
+      })} 1`
+    );
+  }
+
+  return lines.length === 0 ? "" : `${lines.join("\n")}\n`;
+}
+
+function hasMetricFamily(output: string, metric: string): boolean {
+  return output.split("\n").some((line) => line.startsWith(`# HELP ${metric} `)
+    || line.startsWith(`${metric}{`)
+    || line.startsWith(`${metric} `));
+}
+
+function collectExpectedActiveMetric(identity: TranslationMetricIdentity): string {
+  return [
+    "# HELP nutsnews_worker_expected_active Whether this worker deployment is expected to own active production work.",
+    "# TYPE nutsnews_worker_expected_active gauge",
+    `nutsnews_worker_expected_active${labelsKey({
+      environment: boundedLabel(identity.environment),
+      service: TRANSLATION_STAGE
+    })} 0`
+  ].join("\n").concat("\n");
+}
+
+function collectConsumerActiveMetric(
+  identity: TranslationMetricIdentity,
+  activeConsumers: number
+): string {
+  return [
+    "# HELP nutsnews_worker_consumer_active Active translation main-queue consumers reported by the service.",
+    "# TYPE nutsnews_worker_consumer_active gauge",
+    `nutsnews_worker_consumer_active${labelsKey({
+      environment: boundedLabel(identity.environment),
+      service: TRANSLATION_STAGE,
+      queue: TRANSLATION_QUEUE
+    })} ${formatMetricNumber(activeConsumers)}`
+  ].join("\n").concat("\n");
+}
+
+function collectHealthProbeMetrics(
+  identity: TranslationMetricIdentity,
+  health: ReadonlyMap<TranslationHealthProbe, TranslationHealthOutcome>
+): string {
+  const lines = [
+    "# HELP nutsnews_worker_health_probe Worker health status by distinct bounded probe and outcome.",
+    "# TYPE nutsnews_worker_health_probe gauge"
+  ];
+
+  for (const probe of HEALTH_PROBES) {
+    const current = health.get(probe) ?? "unhealthy";
+
+    for (const outcome of HEALTH_OUTCOMES) {
+      lines.push(`nutsnews_worker_health_probe${labelsKey({
+        environment: boundedLabel(identity.environment),
+        service: TRANSLATION_STAGE,
+        probe,
+        outcome
+      })} ${outcome === current ? "1" : "0"}`);
+    }
+  }
+
+  return `${lines.join("\n")}\n`;
+}
+
+function recordHealthEvent(
+  health: Map<TranslationHealthProbe, TranslationHealthOutcome>,
+  event: RuntimeTelemetryEvent
+): void {
+  if (event.name !== "runtime.health.evaluated") {
+    return;
+  }
+
+  const probe = event.attributes?.probe;
+  const outcome = event.outcome;
+
+  if (isHealthProbe(probe) && isHealthOutcome(outcome)) {
+    health.set(probe, outcome);
+  }
+}
+
+function consumerActiveFromEvent(event: RuntimeTelemetryEvent): number | undefined {
+  if (
+    event.name !== "runtime.broker.consumer_state_changed"
+    || event.stage !== TRANSLATION_STAGE
+    || event.queue !== TRANSLATION_QUEUE
+  ) {
+    return undefined;
+  }
+
+  const activeConsumers = event.attributes?.activeConsumers;
+
+  if (typeof activeConsumers === "number" && Number.isFinite(activeConsumers)) {
+    return Math.max(0, Math.floor(activeConsumers));
+  }
+
+  return event.outcome === "active" ? 1 : 0;
+}
+
+function recordConsumerReadinessEvent(
+  health: Map<TranslationHealthProbe, TranslationHealthOutcome>,
+  event: RuntimeTelemetryEvent
+): void {
+  const activeConsumers = consumerActiveFromEvent(event);
+
+  if (activeConsumers === 0) {
+    health.set("readiness", "unhealthy");
+  }
+}
+
+function observeStageEvent(
+  event: RuntimeTelemetryEvent,
+  identity: TranslationMetricIdentity,
+  counters: Map<string, Map<string, number>>,
+  histograms: Map<string, Map<string, HistogramState>>
+): void {
+  if (
+    !COMPLETING_MESSAGE_EVENTS.has(event.name)
+    || event.stage !== TRANSLATION_STAGE
+    || event.queue !== TRANSLATION_QUEUE
+  ) {
+    return;
+  }
+
+  const labels = stageLabels(identity, event);
+  incrementCounter(counters, "nutsnews_worker_uplift_stage_events_total", labels, 1);
+
+  const durationSeconds = secondsFromMilliseconds(event.durationMs);
+
+  if (durationSeconds !== undefined) {
+    observeHistogram(
+      histograms,
+      "nutsnews_worker_uplift_stage_latency_seconds",
+      stageHistogramLabels(identity),
+      durationSeconds
+    );
+  }
 }
 
 function observeTranslationLanguageEvent(
   event: RuntimeTelemetryEvent,
   identity: TranslationMetricIdentity,
+  allowedLanguages: ReadonlySet<string>,
   counters: Map<string, Map<string, number>>,
-  summaries: Map<string, Map<string, { count: number; sum: number }>>
+  histograms: Map<string, Map<string, HistogramState>>
 ): void {
-  if (event.name !== "runtime.dependency.observed" || event.attributes?.event !== "translation.language.reviewed") {
+  if (
+    event.name !== "runtime.dependency.observed"
+    || event.stage !== TRANSLATION_STAGE
+    || event.queue !== TRANSLATION_QUEUE
+    || event.attributes?.event !== "translation.language.reviewed"
+  ) {
     return;
   }
 
-  const language = stringAttribute(event, "targetLanguage");
-  const provider = stringAttribute(event, "provider") ?? "unknown";
-  const result = stringAttribute(event, "result") ?? event.outcome ?? "unknown";
-  const retry = result === "retry"
-    ? "retryable"
-    : result === "permanent_failure"
-      ? "not_retryable"
-      : "none";
-  const labels = labelsFor(identity, {
-    language: language ?? "unknown",
-    provider,
-    result,
-    retry
-  });
-  const latencyMs = event.durationMs ?? numberAttribute(event, "latencyMs");
+  const labels = languageLabels(identity, event, allowedLanguages);
+  const latencyMs = finiteNonNegativeNumber(event.durationMs) ?? numberAttribute(event, "latencyMs");
+  const reusedResult = event.attributes.reusedResult === true;
 
   incrementCounter(counters, "nutsnews_translation_language_results_total", labels, 1);
 
+  if (reusedResult) {
+    return;
+  }
+
   if (latencyMs !== undefined) {
-    observeSummary(summaries, "nutsnews_translation_language_latency_ms", labels, latencyMs);
+    observeHistogram(
+      histograms,
+      "nutsnews_translation_language_duration_seconds",
+      labels,
+      latencyMs / 1_000
+    );
   }
 
   recordTokenMetric(counters, labels, "input", numberAttribute(event, "inputTokens"));
@@ -118,31 +420,56 @@ function observeTranslationLanguageEvent(
 
 function recordTokenMetric(
   counters: Map<string, Map<string, number>>,
-  labels: TranslationMetricLabels,
-  tokenKind: string,
+  labels: MetricLabels,
+  kind: "input" | "output" | "total",
   value: number | undefined
 ): void {
   if (value === undefined) {
     return;
   }
 
-  incrementCounter(counters, "nutsnews_translation_language_tokens_total", {
-    ...labels,
-    token_kind: tokenKind
-  }, value);
+  incrementCounter(counters, `nutsnews_translation_language_${kind}_tokens_total`, labels, value);
 }
 
 function collectCustomMetrics(
   counters: Map<string, Map<string, number>>,
-  summaries: Map<string, Map<string, { count: number; sum: number }>>
+  histograms: Map<string, Map<string, HistogramState>>
 ): string {
   const lines: string[] = [];
 
-  collectCounter(lines, counters, "nutsnews_translation_language_results_total", "Per-language translation outcomes by bounded provider, language, result, and retry class.");
-  collectCounter(lines, counters, "nutsnews_translation_language_tokens_total", "Per-language translation token counts by bounded token kind.");
-  collectSummary(lines, summaries, "nutsnews_translation_language_latency_ms", "Per-language Qwen translation latency in milliseconds.");
+  collectCounter(lines, counters, "nutsnews_worker_uplift_stage_events_total", "Worker stage delivery outcomes using bounded lifecycle labels.");
+  collectHistogram(lines, histograms, "nutsnews_worker_uplift_stage_latency_seconds", "Worker stage delivery latency in seconds.");
+  collectCounter(lines, counters, "nutsnews_translation_language_results_total", "Per-language translation outcomes using bounded language and provider labels.");
+  collectHistogram(lines, histograms, "nutsnews_translation_language_duration_seconds", "Per-language translation dependency latency in seconds.");
+  collectCounter(lines, counters, "nutsnews_translation_language_input_tokens_total", "Per-language translation input tokens.");
+  collectCounter(lines, counters, "nutsnews_translation_language_output_tokens_total", "Per-language translation output tokens.");
+  collectCounter(lines, counters, "nutsnews_translation_language_total_tokens_total", "Per-language translation total tokens.");
 
   return lines.length === 0 ? "" : `${lines.join("\n")}\n`;
+}
+
+function initializeCanonicalStageMetrics(
+  identity: TranslationMetricIdentity,
+  counters: Map<string, Map<string, number>>,
+  histograms: Map<string, Map<string, HistogramState>>
+): void {
+  const stageCounters = samplesFor(counters, "nutsnews_worker_uplift_stage_events_total");
+
+  for (const outcome of TRANSLATION_STAGE_OUTCOMES) {
+    stageCounters.set(labelsKey({
+      ...stageHistogramLabels(identity),
+      outcome
+    }), 0);
+  }
+
+  samplesFor(histograms, "nutsnews_worker_uplift_stage_latency_seconds").set(
+    labelsKey(stageHistogramLabels(identity)),
+    {
+      bucketCounts: TRANSLATION_DURATION_BUCKETS_SECONDS.map(() => 0),
+      count: 0,
+      sum: 0
+    }
+  );
 }
 
 function collectCounter(
@@ -160,52 +487,103 @@ function collectCounter(
   lines.push(`# HELP ${metric} ${help}`);
   lines.push(`# TYPE ${metric} counter`);
 
-  for (const [key, value] of Array.from(samples.entries()).sort(([left], [right]) => left.localeCompare(right))) {
+  for (const [key, value] of sortedEntries(samples)) {
     lines.push(`${metric}${key} ${formatMetricNumber(value)}`);
   }
 }
 
-function collectSummary(
+function collectHistogram(
   lines: string[],
-  summaries: Map<string, Map<string, { count: number; sum: number }>>,
+  histograms: Map<string, Map<string, HistogramState>>,
   metric: string,
   help: string
 ): void {
-  const samples = summaries.get(metric);
+  const samples = histograms.get(metric);
 
   if (samples === undefined) {
     return;
   }
 
   lines.push(`# HELP ${metric} ${help}`);
-  lines.push(`# TYPE ${metric} summary`);
+  lines.push(`# TYPE ${metric} histogram`);
 
-  for (const [key, value] of Array.from(samples.entries()).sort(([left], [right]) => left.localeCompare(right))) {
-    lines.push(`${metric}_count${key} ${formatMetricNumber(value.count)}`);
-    lines.push(`${metric}_sum${key} ${formatMetricNumber(value.sum)}`);
+  for (const [key, state] of sortedEntries(samples)) {
+    for (const [index, boundary] of TRANSLATION_DURATION_BUCKETS_SECONDS.entries()) {
+      lines.push(`${metric}_bucket${labelsWithLe(key, String(boundary))} ${formatMetricNumber(state.bucketCounts[index] ?? 0)}`);
+    }
+
+    lines.push(`${metric}_bucket${labelsWithLe(key, "+Inf")} ${formatMetricNumber(state.count)}`);
+    lines.push(`${metric}_sum${key} ${formatMetricNumber(state.sum)}`);
+    lines.push(`${metric}_count${key} ${formatMetricNumber(state.count)}`);
   }
 }
 
-function labelsFor(
-  identity: TranslationMetricIdentity,
-  labels: TranslationLanguageMetricDimensions
-): TranslationMetricLabels {
+function stageLabels(identity: TranslationMetricIdentity, event: RuntimeTelemetryEvent): MetricLabels {
+  return {
+    ...stageHistogramLabels(identity),
+    outcome: stageOutcome(event)
+  };
+}
+
+function stageHistogramLabels(identity: TranslationMetricIdentity): MetricLabels {
   return {
     environment: boundedLabel(identity.environment),
-    host: boundedLabel(identity.host),
-    service: boundedLabel(identity.service),
-    version: boundedLabel(identity.version),
-    language: boundedLabel(labels.language),
-    provider: boundedLabel(labels.provider),
-    result: boundedLabel(labels.result),
-    retry: boundedLabel(labels.retry)
+    service: TRANSLATION_STAGE
   };
+}
+
+function languageBaseLabels(
+  identity: TranslationMetricIdentity,
+  event: RuntimeTelemetryEvent,
+  outcome: string
+): MetricLabels {
+  return {
+    ...stageHistogramLabels(identity),
+    stage: event.stage === TRANSLATION_STAGE ? TRANSLATION_STAGE : "unknown",
+    outcome
+  };
+}
+
+function languageLabels(
+  identity: TranslationMetricIdentity,
+  event: RuntimeTelemetryEvent,
+  allowedLanguages: ReadonlySet<string>
+): MetricLabels {
+  const language = stringAttribute(event, "targetLanguage");
+  const provider = stringAttribute(event, "provider");
+
+  return {
+    ...languageBaseLabels(identity, event, boundedOutcome(event.outcome)),
+    language: language !== undefined && allowedLanguages.has(language) ? boundedLabel(language) : "unknown",
+    provider: provider !== undefined && ALLOWED_PROVIDERS.has(provider) ? provider : "unknown"
+  };
+}
+
+function stageOutcome(event: RuntimeTelemetryEvent): string {
+  switch (event.name) {
+    case "runtime.message.accepted":
+      return "success";
+    case "runtime.message.duplicate":
+      return "duplicate";
+    case "runtime.message.invalid":
+      return "invalid";
+    case "runtime.message.retry":
+      return "retry";
+    case "runtime.message.dlq":
+      return "dlq";
+    default:
+      return boundedOutcome(event.outcome);
+  }
+}
+
+function boundedOutcome(outcome: string | undefined): string {
+  return outcome !== undefined && ALLOWED_OUTCOMES.has(outcome) ? outcome : "failure";
 }
 
 function incrementCounter(
   counters: Map<string, Map<string, number>>,
   metric: string,
-  labels: TranslationMetricLabels,
+  labels: MetricLabels,
   value: number
 ): void {
   const samples = samplesFor(counters, metric);
@@ -214,23 +592,30 @@ function incrementCounter(
   samples.set(key, (samples.get(key) ?? 0) + Math.max(0, value));
 }
 
-function observeSummary(
-  summaries: Map<string, Map<string, { count: number; sum: number }>>,
+function observeHistogram(
+  histograms: Map<string, Map<string, HistogramState>>,
   metric: string,
-  labels: TranslationMetricLabels,
+  labels: MetricLabels,
   value: number
 ): void {
-  const samples = samplesFor(summaries, metric);
+  const samples = samplesFor(histograms, metric);
   const key = labelsKey(labels);
   const existing = samples.get(key) ?? {
+    bucketCounts: TRANSLATION_DURATION_BUCKETS_SECONDS.map(() => 0),
     count: 0,
     sum: 0
   };
+  const boundedValue = Math.max(0, value);
 
-  samples.set(key, {
-    count: existing.count + 1,
-    sum: existing.sum + Math.max(0, value)
-  });
+  for (const [index, boundary] of TRANSLATION_DURATION_BUCKETS_SECONDS.entries()) {
+    if (boundedValue <= boundary) {
+      existing.bucketCounts[index] = (existing.bucketCounts[index] ?? 0) + 1;
+    }
+  }
+
+  existing.count += 1;
+  existing.sum += boundedValue;
+  samples.set(key, existing);
 }
 
 function samplesFor<T>(container: Map<string, Map<string, T>>, metric: string): Map<string, T> {
@@ -241,18 +626,21 @@ function samplesFor<T>(container: Map<string, Map<string, T>>, metric: string): 
   }
 
   const samples = new Map<string, T>();
-
   container.set(metric, samples);
 
   return samples;
 }
 
-function labelsKey(labels: TranslationMetricLabels): string {
+function labelsKey(labels: MetricLabels): string {
   const entries = Object.entries(labels)
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([key, value]) => `${key}="${escapeLabelValue(value)}"`);
 
   return `{${entries.join(",")}}`;
+}
+
+function labelsWithLe(key: string, boundary: string): string {
+  return `${key.slice(0, -1)},le="${boundary}"}`;
 }
 
 function stringAttribute(event: RuntimeTelemetryEvent, key: string): string | undefined {
@@ -262,9 +650,60 @@ function stringAttribute(event: RuntimeTelemetryEvent, key: string): string | un
 }
 
 function numberAttribute(event: RuntimeTelemetryEvent, key: string): number | undefined {
-  const value = event.attributes?.[key];
+  return finiteNonNegativeNumber(event.attributes?.[key]);
+}
 
+function finiteNonNegativeNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? Math.max(0, value) : undefined;
+}
+
+function secondsFromMilliseconds(value: unknown): number | undefined {
+  const milliseconds = finiteNonNegativeNumber(value);
+
+  return milliseconds === undefined ? undefined : milliseconds / 1_000;
+}
+
+function measuredDurationMs(event: RuntimeTelemetryEvent): number | undefined {
+  return finiteNonNegativeNumber(event.durationMs) ?? numberAttribute(event, "durationMs");
+}
+
+function shouldForwardToRuntimeMetrics(event: RuntimeTelemetryEvent): boolean {
+  // This service owns the bounded, probe-specific health family below. Runtime
+  // 1.x emits the same family for runtime.health.evaluated, so forwarding that
+  // event would duplicate HELP/TYPE metadata and samples after the runtime
+  // upgrade.
+  if (event.name === "runtime.health.evaluated") {
+    return false;
+  }
+
+  if (event.name !== "runtime.dependency.observed") {
+    return true;
+  }
+
+  const durationMs = measuredDurationMs(event);
+
+  if (durationMs === undefined) {
+    return false;
+  }
+
+  return durationMs > 0 || !isStartupDependencyEvent(event);
+}
+
+function isStartupDependencyEvent(event: RuntimeTelemetryEvent): boolean {
+  const dependency = stringAttribute(event, "dependency");
+  const eventName = stringAttribute(event, "event");
+
+  return dependency === "translation-shell"
+    || eventName === "translation.configuration"
+    || eventName === "translation.startup";
+}
+
+function isHealthProbe(value: unknown): value is TranslationHealthProbe {
+  return typeof value === "string" && HEALTH_PROBES.some((probe) => probe === value);
+}
+
+function isHealthOutcome(value: unknown): value is TranslationHealthOutcome {
+  return typeof value === "string" && HEALTH_OUTCOMES.some((outcome) => outcome === value);
 }
 
 function boundedLabel(value: string): string {
@@ -285,4 +724,10 @@ function escapeLabelValue(value: string): string {
 
 function formatMetricNumber(value: number): string {
   return Number.isInteger(value) ? String(value) : value.toFixed(6).replace(/0+$/u, "").replace(/\.$/u, "");
+}
+
+function sortedEntries<T>(map: Map<string, T>): [string, T][] {
+  return [
+    ...map.entries()
+  ].sort(([left], [right]) => left.localeCompare(right));
 }

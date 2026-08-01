@@ -19,11 +19,22 @@ The worker records one independently replayable result per article version, sour
 - Exposes `publishTranslationBacklogRecoveryTask` for reconciliation jobs to republish idempotent `backlog_recovery` translation tasks from durable language-result state without redoing valid languages.
 - Provides injectable Qwen client, prompt registry, language policy, quality validator, durable state, transaction, outbox, broker, and work-handler boundaries.
 - Configures low default prefetch and concurrency, plus per-language concurrency for Qwen-bound translation work.
-- Uses shared runtime broker lifecycle, in-flight drain, idempotency store, retry/DLQ destinations, health reports, and Prometheus metrics.
-- Exposes runtime metrics plus bounded per-language translation metrics for provider, language, result, retry class, latency, and token counts.
-- Keeps liveness independent from Qwen, prompt registry, language policy, and quality validator readiness; `/live` only checks process health, while `/ready` gates an active `translation` main-queue consumer, broker, state, outbox, Qwen, prompt registry, language policy, quality validator, and shadow mode.
+- Uses shared runtime broker lifecycle, in-flight drain, idempotency store, retry/DLQ destinations, health reports, and Prometheus metrics. Its consumer-aware processor emits exactly one accepted, duplicate, invalid, retry, or DLQ completion for every started delivery.
+- Exposes the canonical `nutsnews_worker_uplift_stage_events_total` lifecycle counter and fixed-bucket `nutsnews_worker_uplift_stage_latency_seconds` histogram, plus bounded per-language outcome and duration metrics and separate input/output/total token counters.
+- Retains the runtime package's generic `_duration_ms` summaries temporarily for existing backend outage-report compatibility; the translation-specific millisecond summary has been replaced by seconds histograms.
+- Keeps liveness independent from Qwen, prompt registry, language policy, and quality validator readiness; `/live` and `/livez` only check process health, while `/ready` gates an active `translation` main-queue consumer, broker, state, outbox, Qwen, prompt registry, language policy, quality validator, and shadow mode.
 - Emits bounded structured events and Prometheus metrics when RabbitMQ cancels the consumer, drops its channel, or restores consumption.
 - Contains no approval decision, article persistence, or publication logic.
+
+## Metrics contract
+
+`/metrics` retains the generic runtime 0.5 families and adds two worker-uplift lifecycle families: `nutsnews_worker_uplift_stage_events_total{environment,service,outcome}` and `nutsnews_worker_uplift_stage_latency_seconds{environment,service}`. It also exports `nutsnews_worker_expected_active{environment,service}=0` while translation remains shadow-only, `nutsnews_worker_consumer_active{environment,service,queue}`, and one-hot `nutsnews_worker_health_probe{environment,service,probe,outcome}` series initialized before the first scrape. Startup and consumer state transition with service lifecycle; readiness reflects the last real readiness evaluation and is reset on cancellation or shutdown. A delivery contributes one completion outcome (`success`, `duplicate`, `invalid`, `retry`, or `dlq`) and, when measured, one latency observation. The fixed cumulative buckets are `0.01`, `0.05`, `0.1`, `0.25`, `0.5`, `1`, `2.5`, `5`, `10`, `30`, `60`, `120`, and `300` seconds, followed by `+Inf`, `_sum`, and `_count`.
+
+Per-language metrics use only `environment`, `service`, `stage`, `outcome`, `language`, and `provider`. Languages are restricted to the reviewed `fr`, `ja`, `de-CH`, `de`, and `el` metric allowlist and the provider allowlist contains only `local_ai`; all other values collapse to `unknown`. Message, article, pipeline, correlation, trace, idempotency, model, and prompt identifiers remain structured log fields and are never Prometheus labels.
+
+Runtime 0.5's generic `_duration_ms` summaries remain temporarily for backend outage-report compatibility. Only dependency events with a real measured duration are forwarded to that sink: service startup no longer records a synthetic zero-duration dependency call. Translation-owned latency metrics are fixed-bucket seconds histograms.
+
+Telemetry delivery is best effort at both fan-out and service boundaries. A synchronous sink failure, rejected emission, or metrics-setter error cannot change idempotency state, acknowledgement, retry, or DLQ behavior.
 
 ## Configuration
 
@@ -31,6 +42,7 @@ The HTTP server exposes `/config-schema` with names, defaults, sensitivity, and 
 
 | Variable | Default | Production | Sensitive |
 | --- | --- | --- | --- |
+| `NUTSNEWS_TRANSLATION_BUILD_REVISION` | `development` | required lowercase 40-character Git SHA | no |
 | `NUTSNEWS_TRANSLATION_DATABASE_URL` | unset | required | yes |
 | `NUTSNEWS_TRANSLATION_RABBITMQ_URL` | unset | required | yes |
 | `NUTSNEWS_TRANSLATION_QWEN_BASE_URL` | unset | required | yes |

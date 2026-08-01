@@ -111,6 +111,7 @@ describe("production translation dependencies", () => {
 
 function productionEnv(): NodeJS.ProcessEnv {
   return {
+    NUTSNEWS_TRANSLATION_BUILD_REVISION: "0123456789abcdef0123456789abcdef01234567",
     NUTSNEWS_TRANSLATION_DATABASE_URL: "postgres://translation:secret@example.invalid:5432/nutsnews",
     NUTSNEWS_TRANSLATION_RABBITMQ_URL: "amqp://translation:secret@example.invalid:5672",
     NUTSNEWS_TRANSLATION_QWEN_BASE_URL: "https://ai.example.test",

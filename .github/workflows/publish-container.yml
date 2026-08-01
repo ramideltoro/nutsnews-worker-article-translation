@@ -61,6 +61,8 @@ jobs:
           context: .
           push: true
           tags: ${{ env.IMAGE }}
+          build-args: |
+            BUILD_REVISION=${{ github.sha }}
           secrets: |
             npm_token=${{ secrets.GITHUB_TOKEN }}
           sbom: true

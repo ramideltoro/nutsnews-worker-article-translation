@@ -18,6 +18,7 @@ export interface TranslationConfigVariable {
 
 export const TRANSLATION_CONFIG_SCHEMA = [
   variable("NUTSNEWS_ENVIRONMENT", "Runtime environment label for logs and metrics.", false, false, "local"),
+  variable("NUTSNEWS_TRANSLATION_BUILD_REVISION", "Immutable lowercase 40-character Git commit revision baked into the production image.", true, false, "development"),
   variable("NUTSNEWS_TRANSLATION_HTTP_HOST", "Health and metrics bind host.", false, false, "0.0.0.0"),
   variable("NUTSNEWS_TRANSLATION_HTTP_PORT", "Health and metrics bind port.", false, false, "8080"),
   variable("NUTSNEWS_TRANSLATION_DEPENDENCY_MODE", "Use test dependencies locally or require production dependency presence.", false, false, "test"),
@@ -48,6 +49,7 @@ export interface TranslationConfig {
   readonly serviceName: typeof TRANSLATION_SERVICE_NAME;
   readonly serviceVersion: typeof TRANSLATION_SERVICE_VERSION;
   readonly environment: string;
+  readonly buildRevision: string;
   readonly host: string;
   readonly http: {
     readonly host: string;
@@ -112,12 +114,15 @@ export function loadTranslationConfig(env: NodeJS.ProcessEnv = process.env): Tra
     requireConfigured("NUTSNEWS_TRANSLATION_QWEN_API_KEY", dependencies.qwenCredentialConfigured, issues);
   }
 
+  const buildRevision = parseBuildRevision(env.NUTSNEWS_TRANSLATION_BUILD_REVISION, dependencyMode, issues);
+
   const concurrency = parseInteger(env.NUTSNEWS_TRANSLATION_CONCURRENCY, "NUTSNEWS_TRANSLATION_CONCURRENCY", 2, 1, 16, issues);
   const prefetch = parseInteger(env.NUTSNEWS_TRANSLATION_PREFETCH, "NUTSNEWS_TRANSLATION_PREFETCH", 4, 1, 64, issues);
   const config: TranslationConfig = {
     serviceName: TRANSLATION_SERVICE_NAME,
     serviceVersion: TRANSLATION_SERVICE_VERSION,
     environment: nonEmpty(env.NUTSNEWS_ENVIRONMENT, "local"),
+    buildRevision,
     host: nonEmpty(env.HOSTNAME, os.hostname()),
     http: {
       host: nonEmpty(env.NUTSNEWS_TRANSLATION_HTTP_HOST, "0.0.0.0"),
@@ -214,6 +219,20 @@ function parseDependencyMode(value: string | undefined, issues: string[]): Trans
 
   issues.push("NUTSNEWS_TRANSLATION_DEPENDENCY_MODE must be test or production.");
   return "test";
+}
+
+function parseBuildRevision(
+  value: string | undefined,
+  dependencyMode: TranslationDependencyMode,
+  issues: string[]
+): string {
+  const revision = nonEmpty(value, "development");
+
+  if (dependencyMode === "production" && !/^[0-9a-f]{40}$/u.test(revision)) {
+    issues.push("NUTSNEWS_TRANSLATION_BUILD_REVISION must be a lowercase 40-character Git commit SHA when NUTSNEWS_TRANSLATION_DEPENDENCY_MODE=production.");
+  }
+
+  return revision;
 }
 
 function parseTelemetryLogMode(value: string | undefined, issues: string[]): TranslationTelemetryLogMode {

@@ -5,8 +5,7 @@ import {
   createJsonRuntimeTelemetrySink,
   createRuntimeShutdownController,
   getRuntimePackageMetadata,
-  SYSTEM_RUNTIME_CLOCK,
-  type RuntimeTelemetrySink
+  SYSTEM_RUNTIME_CLOCK
 } from "@ramideltoro/nutsnews-worker-runtime";
 
 import {
@@ -16,6 +15,10 @@ import {
 import type { TranslationDependencies } from "./dependencies.js";
 import { createTranslationHttpServer } from "./http.js";
 import { createTranslationPrometheusMetricsSink } from "./metrics.js";
+import {
+  bestEffortTelemetryFlusher,
+  combineBestEffortTelemetrySinks
+} from "./telemetry.js";
 import { createProductionTranslationDependencies } from "./production.js";
 import { createTranslationService } from "./service.js";
 import { createLocalTranslationDependencies } from "./test-doubles.js";
@@ -68,8 +71,13 @@ export {
   type TranslationReconciler
 } from "./reconciliation.js";
 export {
+  TRANSLATION_DURATION_BUCKETS_SECONDS,
   createTranslationPrometheusMetricsSink,
-  type TranslationPrometheusMetricsSink
+  type TranslationHealthOutcome,
+  type TranslationHealthProbe,
+  type TranslationPrometheusMetricsSink,
+  type TranslationPrometheusMetricsSinkOptions,
+  type TranslationRuntimeMetricsSink
 } from "./metrics.js";
 export {
   LocalAiTranslationQwenClient,
@@ -115,15 +123,28 @@ export interface TranslationApplication {
   readonly config: TranslationConfig;
   start(): Promise<void>;
   stop(): Promise<void>;
+  url(path?: string): string;
 }
 
-export function createTranslationApplication(config = loadTranslationConfig()): TranslationApplication {
+export interface TranslationApplicationOptions {
+  readonly dependencies?: TranslationDependencies;
+}
+
+export function createTranslationApplication(
+  config = loadTranslationConfig(),
+  options: TranslationApplicationOptions = {}
+): TranslationApplication {
   const identity = {
     service: config.serviceName,
     version: config.serviceVersion,
     environment: config.environment,
-    host: config.host
-  };
+    host: config.host,
+    revision: config.buildRevision,
+    deployment: config.dependencyMode === "production"
+      ? "shadow"
+      : config.environment === "test" ? "test" : "local",
+    adapter: config.dependencyMode === "production" ? "production" : "in_memory"
+  } as const;
   const logSink = config.telemetryLogs === "stdout"
     ? createJsonRuntimeTelemetrySink({
         identity,
@@ -134,11 +155,13 @@ export function createTranslationApplication(config = loadTranslationConfig()): 
     : undefined;
   const metrics = config.metricsEnabled
     ? createTranslationPrometheusMetricsSink({
-        identity
+        identity,
+        allowedLanguages: config.languagePolicy.targetLanguages
       })
     : undefined;
-  const telemetry = combineTelemetrySinks(logSink, metrics);
-  const baseDependencies = config.dependencyMode === "production"
+  const telemetry = combineBestEffortTelemetrySinks(logSink, metrics);
+  const telemetryFlusher = bestEffortTelemetryFlusher(logSink);
+  const baseDependencies = options.dependencies ?? (config.dependencyMode === "production"
     ? createProductionTranslationDependencies({
         config,
         clock: SYSTEM_RUNTIME_CLOCK,
@@ -148,8 +171,8 @@ export function createTranslationApplication(config = loadTranslationConfig()): 
       })
     : createLocalTranslationDependencies({
         clock: SYSTEM_RUNTIME_CLOCK
-      });
-  const dependencies = {
+      }));
+  const dependencies = options.dependencies ?? {
     ...baseDependencies,
     workHandler: createArticleTranslationWorkHandler({
       config,
@@ -182,42 +205,136 @@ export function createTranslationApplication(config = loadTranslationConfig()): 
       metrics
     })
   });
+  let startPromise: Promise<void> | undefined;
+  let listenerBound = false;
+  let started = false;
+  let stopped = false;
+  let stopRequested = false;
+  let dependenciesClosed = false;
+  const isStopRequested = (): boolean => stopRequested;
+  const closeListener = async (): Promise<void> => {
+    if (!listenerBound) {
+      return;
+    }
+
+    try {
+      await httpServer.close();
+    } finally {
+      listenerBound = false;
+    }
+  };
+  const closeDependencies = async (): Promise<void> => {
+    if (dependenciesClosed || !hasDependencyCloser(baseDependencies)) {
+      return;
+    }
+
+    dependenciesClosed = true;
+    await baseDependencies.close();
+  };
   const shutdown = createRuntimeShutdownController({
     callbacks: [
       async () => {
-        await httpServer.close();
+        stopRequested = true;
+        await closeListener();
       },
       async () => {
         await service.stop();
       },
-      async () => {
-        if (hasDependencyCloser(baseDependencies)) {
-          await baseDependencies.close();
-        }
-      }
+      closeDependencies
     ],
     signalSource: process,
     timeoutMs: config.shutdownTimeoutMs,
     ...(telemetry === undefined ? {} : {
       telemetry
     }),
-    ...(logSink === undefined ? {} : {
-      telemetryFlusher: logSink
+    ...(telemetryFlusher === undefined ? {} : {
+      telemetryFlusher
     })
   });
 
   return {
     config,
     async start(): Promise<void> {
-      assertPackageCompatibility();
-      await service.start();
-      await httpServer.listen();
-      shutdown.start();
+      if (started) {
+        return;
+      }
+
+      if (stopped) {
+        throw new Error("Translation application cannot be restarted after shutdown.");
+      }
+
+      if (startPromise !== undefined) {
+        await startPromise;
+        return;
+      }
+
+      const operation = (async () => {
+        assertPackageCompatibility();
+
+        try {
+          await httpServer.listen();
+          listenerBound = true;
+          shutdown.start();
+
+          if (isStopRequested()) {
+            await shutdown.trigger("manual");
+            throw new Error("Translation application startup was interrupted by shutdown.");
+          }
+
+          await service.start();
+
+          if (isStopRequested()) {
+            await cleanupBestEffort(() => service.stop());
+            throw new Error("Translation application startup was interrupted by shutdown.");
+          }
+
+          started = true;
+        } catch (error: unknown) {
+          shutdown.stop();
+          await cleanupBestEffort(closeListener);
+          await cleanupBestEffort(() => service.stop());
+          await cleanupBestEffort(closeDependencies);
+          stopped = true;
+
+          throw error;
+        }
+      })();
+
+      startPromise = operation;
+
+      try {
+        await operation;
+      } finally {
+        startPromise = undefined;
+      }
     },
     async stop(): Promise<void> {
-      await shutdown.trigger("manual");
-    }
+      if (stopped || (!started && startPromise === undefined)) {
+        return;
+      }
+
+      stopRequested = true;
+
+      try {
+        if (shutdown.isStarted) {
+          await shutdown.trigger("manual");
+        }
+      } finally {
+        started = false;
+        stopped = true;
+        startPromise = undefined;
+      }
+    },
+    url: (path) => httpServer.url(path)
   };
+}
+
+async function cleanupBestEffort(operation: () => Promise<void>): Promise<void> {
+  try {
+    await operation();
+  } catch {
+    // Startup cleanup cannot replace the original startup failure.
+  }
 }
 
 function hasDependencyCloser(
@@ -242,24 +359,6 @@ function hasReconciliationToken(
   const candidate = dependencies as Partial<{ readonly reconciliationToken: unknown }>;
 
   return typeof candidate.reconciliationToken === "string" && candidate.reconciliationToken.length > 0;
-}
-
-function combineTelemetrySinks(
-  ...sinks: readonly (RuntimeTelemetrySink | undefined)[]
-): RuntimeTelemetrySink | undefined {
-  const configured = sinks.filter((sink): sink is RuntimeTelemetrySink => sink !== undefined);
-
-  if (configured.length === 0) {
-    return undefined;
-  }
-
-  return {
-    emit: async (event) => {
-      for (const sink of configured) {
-        await sink.emit(event);
-      }
-    }
-  };
 }
 
 export const SUPPORTED_RUNTIME_PACKAGE_VERSION = "0.5.0";

@@ -1,4 +1,3 @@
-import { createPrometheusRuntimeTelemetrySink } from "@ramideltoro/nutsnews-worker-runtime";
 import {
   afterEach,
   describe,
@@ -15,8 +14,12 @@ import {
   type TranslationReconciliationReport,
   type TranslationReconciler
 } from "../src/reconciliation.js";
+import { createTranslationPrometheusMetricsSink } from "../src/metrics.js";
 import { createTranslationService } from "../src/service.js";
-import { createLocalTranslationDependencies } from "../src/test-doubles.js";
+import {
+  createLocalTranslationDependencies,
+  createMinimalTranslationDelivery
+} from "../src/test-doubles.js";
 
 let activeServer: TranslationHttpServer | undefined;
 
@@ -34,17 +37,20 @@ describe("translation HTTP endpoints", () => {
       NUTSNEWS_TRANSLATION_HTTP_PORT: "0",
       NUTSNEWS_TRANSLATION_TELEMETRY_LOGS: "silent"
     });
-    const metrics = createPrometheusRuntimeTelemetrySink({
+    const metrics = createTranslationPrometheusMetricsSink({
       identity: {
         service: config.serviceName,
         version: config.serviceVersion,
         environment: config.environment,
         host: config.host
-      }
+      },
+      allowedLanguages: config.languagePolicy.targetLanguages
     });
+    const dependencies = createLocalTranslationDependencies();
     const service = createTranslationService({
       config,
-      dependencies: createLocalTranslationDependencies(),
+      dependencies,
+      telemetry: metrics,
       metrics
     });
     activeServer = createTranslationHttpServer({
@@ -54,15 +60,28 @@ describe("translation HTTP endpoints", () => {
     });
 
     await service.start();
+    await service.processDelivery(createMinimalTranslationDelivery());
     await activeServer.listen();
 
     await expectJsonStatus(activeServer.url("/live"), 200, "ok");
+    await expectJsonStatus(activeServer.url("/livez"), 200, "ok");
     await expectJsonStatus(activeServer.url("/startup"), 200, "ok");
     await expectJsonStatus(activeServer.url("/ready"), 200, "ok");
 
     const metricsResponse = await fetch(activeServer.url("/metrics"));
     expect(metricsResponse.status).toBe(200);
-    expect(await metricsResponse.text()).toContain("nutsnews_worker_dependency_duration_ms");
+    expect(metricsResponse.headers.get("content-type")).toContain("text/plain; version=0.0.4");
+    const metricsBody = await metricsResponse.text();
+    expect(metricsBody).toContain("nutsnews_worker_dependency_duration_ms");
+    expect(metricsBody).toContain("nutsnews_worker_uplift_stage_events_total");
+    expect(metricsBody).toContain('nutsnews_worker_uplift_stage_latency_seconds_bucket{environment="local",service="translation",le="30"} 1');
+    expect(metricsBody).toContain('nutsnews_worker_expected_active{environment="local",service="translation"} 0');
+    expect(metricsBody).toContain('nutsnews_worker_consumer_active{environment="local",queue="nutsnews.worker.translation.v1",service="translation"} 1');
+    expect(metricsBody).toContain('nutsnews_worker_health_probe{environment="local",outcome="ok",probe="liveness",service="translation"} 1');
+    expect(metricsBody).toContain('nutsnews_worker_health_probe{environment="local",outcome="ok",probe="startup",service="translation"} 1');
+    expect(metricsBody).toContain('nutsnews_worker_health_probe{environment="local",outcome="ok",probe="readiness",service="translation"} 1');
+    expect(metricsBody).not.toContain("article-001");
+    expect(metricsBody).not.toContain("approval:translation:");
 
     const schemaResponse = await fetch(activeServer.url("/config-schema"));
     expect(schemaResponse.status).toBe(200);

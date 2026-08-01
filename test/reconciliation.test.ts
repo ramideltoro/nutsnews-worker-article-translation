@@ -412,6 +412,7 @@ const testConfig: TranslationConfig = {
   serviceName: "nutsnews-worker-article-translation",
   serviceVersion: "0.1.0",
   environment: "test",
+  buildRevision: "development",
   host: "test-host",
   http: {
     host: "127.0.0.1",

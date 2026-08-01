@@ -29,6 +29,7 @@ import {
   type TranslationWorkTools
 } from "./dependencies.js";
 import { stableUuid } from "./ids.js";
+import { bestEffortTelemetrySink } from "./telemetry.js";
 
 export interface ArticleTranslationWorkHandlerOptions {
   readonly config: TranslationConfig;
@@ -82,9 +83,17 @@ const TRANSLATION_QUEUE = getWorkerRoute("translation").mainQueue.name;
 const SUMMARY_UNSAFE_RE = /bearer |api_key=|apikey=|token=|secret=|password=|private_key|service_role/iu;
 
 export function createArticleTranslationWorkHandler(options: ArticleTranslationWorkHandlerOptions): TranslationWorkHandler {
+  const telemetry = bestEffortTelemetrySink(options.telemetry);
+  const safeOptions = telemetry === undefined
+    ? options
+    : {
+        ...options,
+        telemetry
+      };
+
   return {
     name: "article-translation-work-handler",
-    handle: (context, tools) => handleTranslation(context, tools, options)
+    handle: (context, tools) => handleTranslation(context, tools, safeOptions)
   };
 }
 
@@ -792,8 +801,12 @@ async function emitLanguageTelemetry(
     at: runtimeNow(options.dependencies.clock),
     stage: "translation",
     queue: TRANSLATION_QUEUE,
-    durationMs: result.latencyMs,
-    outcome: result.status === "success" ? "success" : "failure",
+    ...(reusedResult ? {} : {
+      durationMs: result.latencyMs
+    }),
+    outcome: reusedResult
+      ? "duplicate"
+      : result.status === "success" ? "success" : "failure",
     attributes: {
       event: "translation.language.reviewed",
       dependency: "article-translation",

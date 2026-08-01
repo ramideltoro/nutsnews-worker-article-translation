@@ -3,8 +3,7 @@ import { timingSafeEqual } from "node:crypto";
 import type { AddressInfo } from "node:net";
 
 import {
-  runtimeHealthEndpointResponse,
-  type PrometheusRuntimeTelemetrySink
+  runtimeHealthEndpointResponse
 } from "@ramideltoro/nutsnews-worker-runtime";
 
 import {
@@ -17,11 +16,12 @@ import {
   type TranslationReconciler
 } from "./reconciliation.js";
 import type { TranslationService } from "./service.js";
+import type { TranslationRuntimeMetricsSink } from "./metrics.js";
 
 export interface TranslationHttpServerOptions {
   readonly config: TranslationConfig;
   readonly service: TranslationService;
-  readonly metrics?: PrometheusRuntimeTelemetrySink;
+  readonly metrics?: TranslationRuntimeMetricsSink;
   readonly reconciler?: TranslationReconciler;
   readonly reconciliationToken?: string;
 }
@@ -90,6 +90,7 @@ async function routeRequest(
 
   switch (url.pathname) {
     case "/live":
+    case "/livez":
     case "/healthz":
       writeHealth(response, await options.service.health.liveness());
       return;

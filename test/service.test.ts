@@ -4,7 +4,7 @@ import {
 } from "@ramideltoro/nutsnews-worker-contracts";
 import {
   createBufferedRuntimeTelemetrySink,
-  createPrometheusRuntimeTelemetrySink
+  type RuntimeTelemetryEvent
 } from "@ramideltoro/nutsnews-worker-runtime";
 import {
   describe,
@@ -13,6 +13,7 @@ import {
 } from "vitest";
 
 import { loadTranslationConfig } from "../src/config.js";
+import { createTranslationPrometheusMetricsSink } from "../src/metrics.js";
 import { createTranslationService } from "../src/service.js";
 import {
   InMemoryTranslationStateStore,
@@ -43,7 +44,16 @@ describe("createTranslationService", () => {
     expect((await context.service.health.liveness()).status).toBe("ok");
     expect((await context.service.health.startup()).status).toBe("ok");
     expect((await context.service.health.readiness()).status).toBe("ok");
-    expect(context.metrics.collect()).toContain("nutsnews_worker_dependency_duration_ms");
+    expect(context.metrics.collect()).not.toContain("nutsnews_worker_dependency_duration_ms");
+
+    await context.broker.deliverTranslation();
+
+    const metricsOutput = context.metrics.collect();
+    const dependencyCounts = metricsOutput
+      .split("\n")
+      .filter((line) => line.startsWith("nutsnews_worker_dependency_duration_ms_count{"));
+    expect(dependencyCounts).toHaveLength(1);
+    expect(dependencyCounts[0]).toMatch(/ 1$/u);
 
     await context.service.stop();
 
@@ -182,18 +192,24 @@ function createServiceContext() {
   });
   const dependencies = createLocalTranslationDependencies();
   const telemetry = createBufferedRuntimeTelemetrySink();
-  const metrics = createPrometheusRuntimeTelemetrySink({
+  const metrics = createTranslationPrometheusMetricsSink({
     identity: {
       service: config.serviceName,
       version: config.serviceVersion,
       environment: config.environment,
       host: config.host
-    }
+    },
+    allowedLanguages: config.languagePolicy.targetLanguages
   });
   const service = createTranslationService({
     config,
     dependencies,
-    telemetry,
+    telemetry: {
+      emit: async (event: RuntimeTelemetryEvent) => {
+        await telemetry.emit(event);
+        await metrics.emit(event);
+      }
+    },
     metrics
   });
 
