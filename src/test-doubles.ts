@@ -548,6 +548,7 @@ function defaultQwenResponse(targetLanguage: string): unknown {
   ]);
 
   return {
+    title: `Localized ${targetLanguage} title`,
     summary: summaries.get(targetLanguage) ?? "Le rapport decrit une avancee utile avec des details suffisants pour publication.",
     qualityScore: 93,
     latencyMs: 41,

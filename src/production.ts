@@ -2817,6 +2817,7 @@ function mapLocalAiTranslation(raw: unknown, latencyMs: number): unknown {
   const usage = usageFromLocalAi(raw);
 
   return {
+    title: stringFrom(raw.title, ""),
     summary: stringFrom(raw.summary, ""),
     qualityScore: 92,
     latencyMs: numberFrom(raw.duration_ms, latencyMs),
@@ -3168,7 +3169,12 @@ function isTranslationResultSnapshot(value: unknown): value is TranslationStored
     && typeof value.model === "string"
     && typeof value.promptId === "string"
     && typeof value.promptVersion === "string"
-    && (value.status !== "success" || (typeof value.summary === "string" && value.summary.trim().length > 0));
+    && (value.status !== "success" || (
+      typeof value.title === "string"
+      && value.title.trim().length > 0
+      && typeof value.summary === "string"
+      && value.summary.trim().length > 0
+    ));
 }
 
 function isReplayableTranslationResultSnapshot(value: unknown): value is TranslationStoredLanguageResult {
@@ -3186,7 +3192,9 @@ function isReplayableTranslationResultSnapshot(value: unknown): value is Transla
     return false;
   }
 
-  return value.status === "success" ? value.summaryRef !== undefined && value.summary !== undefined : true;
+  return value.status === "success"
+    ? value.summaryRef !== undefined && value.title !== undefined && value.summary !== undefined
+    : true;
 }
 
 function orderedSummaryRef(

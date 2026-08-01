@@ -58,6 +58,7 @@ export interface TranslationTaskInput {
 }
 
 interface QwenTranslationDecision {
+  readonly title: string;
   readonly summary: string;
   readonly qualityScore: number;
   readonly latencyMs: number;
@@ -306,6 +307,7 @@ async function translateLanguage(
     status: "success",
     result: storedLanguageResult(context, input, targetLanguage, prompt, options.config, options.dependencies.clock, {
       status: "success",
+      title: validation.value.title,
       summary: quality.normalizedSummary,
       qualityScore: validation.value.qualityScore,
       usage: validation.value.usage,
@@ -370,6 +372,7 @@ function qwenRequest(
     responseSchema: {
       name: "translation_result_v1",
       requiredFields: [
+        "title",
         "summary",
         "qualityScore"
       ]
@@ -481,6 +484,7 @@ function storedLanguageResult(
   values: {
     readonly status: "success" | "permanent_failure";
     readonly failureReason?: string;
+    readonly title?: string;
     readonly summary?: string;
     readonly qualityScore: number;
     readonly usage?: QwenTranslationDecision["usage"];
@@ -536,6 +540,9 @@ function storedLanguageResult(
     status: values.status,
     ...(values.failureReason === undefined ? {} : {
       failureReason: values.failureReason
+    }),
+    ...(values.title === undefined ? {} : {
+      title: values.title
     }),
     ...(values.summary === undefined ? {} : {
       summary: values.summary
@@ -754,19 +761,21 @@ function validateQwenTranslation(
     return invalidTranslation("invalid_ai_translation_schema", 0, fallbackLatencyMs);
   }
 
+  const title = raw.title;
   const summary = raw.summary;
   const qualityScore = raw.qualityScore;
   const latencyMs = typeof raw.latencyMs === "number" && Number.isFinite(raw.latencyMs)
     ? Math.max(0, raw.latencyMs)
     : fallbackLatencyMs;
 
-  if (typeof summary !== "string" || summary.trim().length === 0 || !score(qualityScore)) {
+  if (typeof title !== "string" || title.trim().length === 0 || typeof summary !== "string" || summary.trim().length === 0 || !score(qualityScore)) {
     return invalidTranslation("invalid_ai_translation_schema", 0, latencyMs);
   }
 
+  const trimmedTitle = title.trim();
   const trimmed = summary.trim();
 
-  if (SUMMARY_UNSAFE_RE.test(trimmed)) {
+  if (trimmedTitle.length > 500 || SUMMARY_UNSAFE_RE.test(trimmedTitle) || SUMMARY_UNSAFE_RE.test(trimmed)) {
     return invalidTranslation("unsafe_summary_content", qualityScore, latencyMs);
   }
 
@@ -775,6 +784,7 @@ function validateQwenTranslation(
   return {
     status: "success",
     value: {
+      title: trimmedTitle,
       summary: trimmed,
       qualityScore,
       latencyMs,

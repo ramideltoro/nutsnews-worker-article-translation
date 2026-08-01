@@ -99,6 +99,7 @@ describe("production translation dependencies", () => {
     });
 
     await expect(client.translate(translationRequest())).resolves.toMatchObject({
+      title: "Bibliotheques de quartier",
       summary: "Des eleves creent des boites a livres pour leur quartier, donnant aux familles un acces plus simple a des lectures positives.",
       qualityScore: 92,
       latencyMs: 4210,

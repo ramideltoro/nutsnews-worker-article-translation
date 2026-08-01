@@ -108,6 +108,7 @@ describe("translation test doubles", () => {
       responseSchema: {
         name: "translation_result_v1",
         requiredFields: [
+          "title",
           "summary",
           "qualityScore"
         ]

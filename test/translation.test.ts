@@ -66,6 +66,7 @@ describe("createArticleTranslationWorkHandler", () => {
       responseSchema: {
         name: "translation_result_v1",
         requiredFields: [
+          "title",
           "summary",
           "qualityScore"
         ]
@@ -276,6 +277,7 @@ describe("createArticleTranslationWorkHandler", () => {
     const context = createTranslationContext();
 
     context.qwenClient.responsesByLanguage.set("ja", {
+      title: "地域の公共利益に関する記事",
       summary: "The article reports a useful public-interest development with details.",
       qualityScore: 42,
       latencyMs: 19
@@ -359,6 +361,7 @@ describe("createArticleTranslationWorkHandler", () => {
     const context = createTranslationContext();
 
     context.qwenClient.responsesByLanguage.set("ja", {
+      title: "地域社会に役立つ進展",
       summary: "この記事は、地域社会に役立つ進展を具体的に伝えています。",
       qualityScore: 42,
       latencyMs: 19
