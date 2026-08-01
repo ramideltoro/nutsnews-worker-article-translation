@@ -28,7 +28,10 @@ export interface TranslationDatabaseTransaction {
 export interface TranslationDatabaseTransactionRunner {
   readonly name: string;
   probe(): TranslationDependencyProbe | Promise<TranslationDependencyProbe>;
-  withTransaction<T>(operation: (transaction: TranslationDatabaseTransaction) => Promise<T>): Promise<T>;
+  withTransaction<T>(
+    operation: (transaction: TranslationDatabaseTransaction) => Promise<T>,
+    signal?: AbortSignal
+  ): Promise<T>;
 }
 
 export interface TranslationBrokerOutbox {
@@ -83,7 +86,11 @@ export interface TranslationWorkTools {
 
 export interface TranslationWorkHandler {
   readonly name: string;
-  handle(context: RuntimeMessageContext, tools: TranslationWorkTools): RuntimeHandlerResult | Promise<RuntimeHandlerResult>;
+  handle(
+    context: RuntimeMessageContext,
+    tools: TranslationWorkTools,
+    signal: AbortSignal
+  ): RuntimeHandlerResult | Promise<RuntimeHandlerResult>;
 }
 
 export interface TranslationDependencies {
@@ -185,6 +192,7 @@ export interface TranslationQwenRequest {
   readonly prompt: TranslationPrompt;
   readonly timeoutMs: number;
   readonly maxInputBytes: number;
+  readonly signal?: AbortSignal;
   readonly deterministic: {
     readonly temperature: 0;
     readonly topP: 1;

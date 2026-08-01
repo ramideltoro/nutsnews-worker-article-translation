@@ -6,6 +6,8 @@ COPY .npmrc package.json package-lock.json ./
 RUN --mount=type=secret,id=npm_token NODE_AUTH_TOKEN="$(cat /run/secrets/npm_token)" npm ci
 
 FROM dependencies AS build
+COPY Dockerfile ./Dockerfile
+COPY .github ./.github
 COPY tsconfig.json tsconfig.eslint.json eslint.config.js vitest.config.ts vitest.integration.config.ts ./
 COPY src ./src
 COPY test ./test
@@ -16,7 +18,9 @@ RUN --mount=type=secret,id=npm_token NODE_AUTH_TOKEN="$(cat /run/secrets/npm_tok
     && npm cache clean --force
 
 FROM node:24.16.0-alpine AS runtime
-ENV NODE_ENV=production
+ARG BUILD_REVISION=development
+ENV NODE_ENV=production \
+    NUTSNEWS_TRANSLATION_BUILD_REVISION=${BUILD_REVISION}
 WORKDIR /app
 RUN rm -rf /usr/local/lib/node_modules/npm \
     && rm -f /usr/local/bin/npm /usr/local/bin/npx \
@@ -27,5 +31,5 @@ COPY --from=build /app/dist ./dist
 COPY package.json README.md LICENSE ./
 USER nutsnews
 EXPOSE 8080
-HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 CMD node -e "fetch('http://127.0.0.1:8080/ready').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 CMD node -e "fetch('http://127.0.0.1:8080/live').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 CMD ["node", "dist/src/index.js"]

@@ -1,29 +1,21 @@
 import {
-  getRetryDestination,
-  getWorkerRoute,
-  validateStagePayload,
-  validateWorkerEnvelope,
-  type StagePayloadValidationIssue,
-  type WorkerMessageEnvelope
+  getWorkerRoute
 } from "@ramideltoro/nutsnews-worker-contracts";
 import {
   createBrokerLifecycle,
   createBrokerConsumerReadinessCheck,
   createRuntimeHealthProbeSet,
   createRuntimeInFlightDrainController,
+  createRuntimeMessageProcessor,
   emitRuntimeTelemetry,
   runtimeNow,
   type BrokerConsumerHandle,
   type BrokerLifecycle,
-  type PrometheusRuntimeTelemetrySink,
   type RuntimeHealthCheck,
   type RuntimeHealthProbeSet,
-  type RuntimeIdempotencyStore,
-  type RuntimeMessageContext,
   type RuntimeMessageDelivery,
   type RuntimeMessageProcessingResult,
-  type RuntimeTelemetrySink,
-  type RuntimeValidationIssue
+  type RuntimeTelemetrySink
 } from "@ramideltoro/nutsnews-worker-runtime";
 
 import type { TranslationConfig } from "./config.js";
@@ -31,12 +23,22 @@ import type {
   TranslationDependencies,
   TranslationDependencyProbe
 } from "./dependencies.js";
+import type {
+  TranslationRuntimeMetricsSink
+} from "./metrics.js";
+import { withTranslationPublishSignal } from "./production.js";
+import {
+  bestEffortTelemetrySink,
+  runTelemetryBestEffort
+} from "./telemetry.js";
+
+export const TRANSLATION_PROCESSING_DEADLINE_MS = 210_000;
 
 export interface TranslationServiceOptions {
   readonly config: TranslationConfig;
   readonly dependencies: TranslationDependencies;
   readonly telemetry?: RuntimeTelemetrySink;
-  readonly metrics?: PrometheusRuntimeTelemetrySink;
+  readonly metrics?: TranslationRuntimeMetricsSink;
 }
 
 export interface TranslationService {
@@ -53,6 +55,7 @@ export interface TranslationService {
 export function createTranslationService(options: TranslationServiceOptions): TranslationService {
   const translationRoute = getWorkerRoute("translation");
   const persistenceRoute = getWorkerRoute("persistence");
+  const telemetry = bestEffortTelemetrySink(options.telemetry);
   const broker = createBrokerLifecycle({
     transport: options.dependencies.brokerTransport,
     routes: [
@@ -60,34 +63,67 @@ export function createTranslationService(options: TranslationServiceOptions): Tr
       persistenceRoute
     ],
     clock: options.dependencies.clock,
-    ...(options.telemetry === undefined ? {} : {
-      telemetry: options.telemetry
+    ...(telemetry === undefined ? {} : {
+      telemetry
     })
   });
   const drain = createRuntimeInFlightDrainController({
     timeoutMs: options.config.shutdownTimeoutMs
   });
-  const processor = createTranslationInputProcessor({
-    dependencies: options.dependencies,
-    ...(options.telemetry === undefined ? {} : {
-      telemetry: options.telemetry
+  const processor = createRuntimeMessageProcessor({
+    stage: "translation",
+    idempotencyStore: options.dependencies.stateStore,
+    clock: options.dependencies.clock,
+    ...(telemetry === undefined ? {} : {
+      telemetry
     }),
     handler: async (context) => {
+      const deadlineController = new AbortController();
+      const deadline = setTimeout(() => {
+        const error = new Error("Translation processing deadline exceeded.");
+        error.name = "TimeoutError";
+        deadlineController.abort(error);
+      }, TRANSLATION_PROCESSING_DEADLINE_MS);
+      deadline.unref();
+      const signal = deadlineController.signal;
+
       try {
         return await drain.track(async () => {
-          options.metrics?.setInFlight(translationRoute.mainQueue.name, drain.inFlight);
+          signal.throwIfAborted();
+          const dependencyStartedAtMs = options.dependencies.clock.now().getTime();
           const result = await options.dependencies.workHandler.handle(context, {
-            publish: (command) => broker.publish(command),
-            recordOutbox: (command, receipt) => options.dependencies.brokerOutbox.record(command, receipt),
-            withTransaction: (operation) => options.dependencies.transactionRunner.withTransaction(operation)
-          });
+            publish: async (command) => {
+              signal.throwIfAborted();
+              const receipt = await broker.publish(withTranslationPublishSignal(command, signal));
+              signal.throwIfAborted();
 
-          await emitRuntimeTelemetry(options.telemetry, {
+              return receipt;
+            },
+            recordOutbox: async (command, receipt) => {
+              signal.throwIfAborted();
+              await options.dependencies.brokerOutbox.record(command, receipt);
+              signal.throwIfAborted();
+            },
+            withTransaction: async (operation) => {
+              signal.throwIfAborted();
+              const value = await options.dependencies.transactionRunner.withTransaction(
+                operation,
+                signal
+              );
+              signal.throwIfAborted();
+
+              return value;
+            }
+          }, signal);
+          signal.throwIfAborted();
+
+          await emitRuntimeTelemetry(telemetry, {
             name: "runtime.dependency.observed",
             level: result.status === "ok" ? "info" : "warn",
             at: runtimeNow(options.dependencies.clock),
             stage: "translation",
             queue: translationRoute.mainQueue.name,
+            durationMs: elapsedMs(options.dependencies.clock, dependencyStartedAtMs),
             outcome: result.status === "ok" ? "success" : result.status === "retry" ? "retry" : "failure",
             attributes: {
               event: "translation.message.delegated",
@@ -99,12 +135,26 @@ export function createTranslationService(options: TranslationServiceOptions): Tr
           return result;
         });
       } finally {
-        options.metrics?.setInFlight(translationRoute.mainQueue.name, drain.inFlight);
+        clearTimeout(deadline);
       }
     }
   });
   let started = false;
   let consumer: BrokerConsumerHandle | undefined;
+  let transportEmitsConsumerTelemetry = false;
+  let lastFallbackConsumerState: string | undefined;
+  const emitFallbackConsumerState = async (
+    status: ReturnType<BrokerLifecycle["consumerStatus"]>
+  ): Promise<void> => {
+    const state = `${status.state}:${String(status.activeConsumers)}`;
+
+    if (state === lastFallbackConsumerState) {
+      return;
+    }
+
+    await emitConsumerStateBestEffort(telemetry, options.dependencies, status);
+    lastFallbackConsumerState = state;
+  };
 
   const service = {
     get broker(): BrokerLifecycle {
@@ -131,8 +181,8 @@ export function createTranslationService(options: TranslationServiceOptions): Tr
           shadowModeCheck(options.config)
         ],
         clock: options.dependencies.clock,
-        ...(options.telemetry === undefined ? {} : {
-          telemetry: options.telemetry
+        ...(telemetry === undefined ? {} : {
+          telemetry
         })
       });
     },
@@ -151,25 +201,32 @@ export function createTranslationService(options: TranslationServiceOptions): Tr
       }
 
       await broker.start();
-      consumer = await broker.consume("translation", processor);
-      started = true;
-      options.metrics?.recordDependencyLatency(translationRoute.mainQueue.name, 0, "success");
-      options.metrics?.setInFlight(translationRoute.mainQueue.name, drain.inFlight);
-      await emitRuntimeTelemetry(options.telemetry, {
-        name: "runtime.dependency.observed",
-        level: "info",
-        at: runtimeNow(options.dependencies.clock),
-        stage: "translation",
-        queue: translationRoute.mainQueue.name,
-        outcome: "success",
-        attributes: {
-          dependency: "translation-shell",
-          mode: options.config.dependencyMode,
-          prefetch: options.config.prefetch,
-          concurrency: options.config.concurrency,
-          qwenModel: options.config.qwen.model,
-          shadowMode: options.config.shadowMode
+      const brokerConsumer = await broker.consume("translation", processor);
+      const consumerStatus = broker.consumerStatus("translation");
+      transportEmitsConsumerTelemetry = consumerStatus.reason !== "transport-status-unavailable";
+
+      if (!transportEmitsConsumerTelemetry) {
+        await emitFallbackConsumerState(consumerStatus);
+      }
+
+      consumer = {
+        stage: brokerConsumer.stage,
+        cancel: async () => {
+          await brokerConsumer.cancel();
+
+          if (!transportEmitsConsumerTelemetry) {
+            await emitFallbackConsumerState(broker.consumerStatus("translation"));
+          }
+
+          await refreshHealthBestEffort(() => service.health.readiness());
         }
+      };
+      started = true;
+      await refreshHealthBestEffort(async () => {
+        await Promise.all([
+          service.health.startup(),
+          service.health.readiness()
+        ]);
       });
     },
     async stop(): Promise<void> {
@@ -178,13 +235,23 @@ export function createTranslationService(options: TranslationServiceOptions): Tr
       }
 
       drain.stopAcceptingWork();
-      options.metrics?.setShutdownDraining(true);
+      setShutdownDraining(options.metrics, true);
       await drain.waitForDrain(options.config.shutdownTimeoutMs);
       await broker.stop("shutdown");
-      options.metrics?.setShutdownDraining(false);
-      options.metrics?.setInFlight(translationRoute.mainQueue.name, drain.inFlight);
+
+      if (!transportEmitsConsumerTelemetry) {
+        await emitFallbackConsumerState(broker.consumerStatus("translation"));
+      }
+
       consumer = undefined;
       started = false;
+      setShutdownDraining(options.metrics, false);
+      await refreshHealthBestEffort(async () => {
+        await Promise.all([
+          service.health.startup(),
+          service.health.readiness()
+        ]);
+      });
     },
     processDelivery(delivery: RuntimeMessageDelivery): Promise<RuntimeMessageProcessingResult> {
       return processor(delivery);
@@ -194,112 +261,41 @@ export function createTranslationService(options: TranslationServiceOptions): Tr
   return service;
 }
 
-interface TranslationInputProcessorOptions {
-  readonly dependencies: TranslationDependencies;
-  readonly telemetry?: RuntimeTelemetrySink;
-  handler(context: RuntimeMessageContext): Promise<{ readonly status: "ok" } | { readonly status: "retry"; readonly reason: string; readonly retryAfterMs?: number } | { readonly status: "terminal-failure"; readonly reason: string }>;
+function setShutdownDraining(
+  metrics: TranslationRuntimeMetricsSink | undefined,
+  draining: boolean
+): void {
+  runTelemetryBestEffort(() => metrics?.setShutdownDraining(draining));
 }
 
-function createTranslationInputProcessor(options: TranslationInputProcessorOptions) {
-  return async (delivery: RuntimeMessageDelivery): Promise<RuntimeMessageProcessingResult> => {
-    const receivedAt = delivery.receivedAt ?? runtimeNow(options.dependencies.clock);
-    const queue = getWorkerRoute("translation").mainQueue.name;
-    await emitRuntimeTelemetry(options.telemetry, {
-      name: "runtime.message.started",
-      level: "info",
-      at: runtimeNow(options.dependencies.clock),
-      stage: "translation",
-      queue,
-      outcome: "started"
-    });
+async function refreshHealthBestEffort(
+  operation: () => Promise<unknown>
+): Promise<void> {
+  try {
+    await operation();
+  } catch {
+    // Health evaluation is observational and must not change lifecycle outcomes.
+  }
+}
 
-    const envelopeResult = validateWorkerEnvelope(delivery.envelope);
-
-    if (!envelopeResult.ok) {
-      return {
-        action: "dlq",
-        reason: "invalid-envelope",
-        issues: envelopeResult.issues.map(toRuntimeValidationIssue)
-      };
+async function emitConsumerStateBestEffort(
+  telemetry: RuntimeTelemetrySink | undefined,
+  dependencies: TranslationDependencies,
+  status: ReturnType<BrokerLifecycle["consumerStatus"]>
+): Promise<void> {
+  await emitRuntimeTelemetry(telemetry, {
+    name: "runtime.broker.consumer_state_changed",
+    level: status.activeConsumers > 0 ? "info" : "error",
+    at: runtimeNow(dependencies.clock),
+    stage: status.stage,
+    queue: status.queue,
+    outcome: status.state,
+    attributes: {
+      activeConsumers: status.activeConsumers,
+      state: status.state,
+      reason: status.reason
     }
-
-    const envelope = envelopeResult.value;
-
-    if (envelope.route !== "translation") {
-      return terminalResult(envelope, "stage-mismatch", [
-        {
-          path: "$.route",
-          code: "stage-mismatch",
-          message: `Envelope route ${envelope.route} does not match processor stage translation.`
-        }
-      ]);
-    }
-
-    const payloadResult = validateStagePayload(delivery.payload);
-
-    if (!payloadResult.ok) {
-      return terminalResult(envelope, "invalid-payload", payloadResult.issues.map(toRuntimeValidationIssue));
-    }
-
-    if (payloadResult.definition.consumer !== "translation") {
-      return terminalResult(envelope, "payload-consumer-mismatch", [
-        {
-          path: "$.schemaId",
-          code: "payload-consumer-mismatch",
-          message: `Payload schema consumer ${payloadResult.definition.consumer} does not match translation.`
-        }
-      ]);
-    }
-
-    const claim = await options.dependencies.stateStore.claim(envelope.idempotencyKey, {
-      envelope,
-      stage: "translation",
-      receivedAt
-    });
-
-    if (claim.status === "already-completed") {
-      return {
-        action: "ack",
-        reason: "duplicate",
-        envelope
-      };
-    }
-
-    if (claim.status === "in-progress") {
-      return retryOrDlq(envelope, "idempotency-in-progress", 1_000);
-    }
-
-    const context: RuntimeMessageContext = {
-      envelope,
-      payload: payloadResult.value,
-      stage: "translation",
-      receivedAt
-    };
-
-    try {
-      const result = await options.handler(context);
-
-      if (result.status === "ok") {
-        await markCompleted(options.dependencies.stateStore, envelope, options.dependencies.clock);
-        return {
-          action: "ack",
-          reason: "handled",
-          envelope
-        };
-      }
-
-      if (result.status === "retry") {
-        await markFailed(options.dependencies.stateStore, envelope, result.reason, true, options.dependencies.clock);
-        return retryOrDlq(envelope, result.reason, result.retryAfterMs);
-      }
-
-      await markFailed(options.dependencies.stateStore, envelope, result.reason, false, options.dependencies.clock);
-      return terminalResult(envelope, result.reason);
-    } catch (error: unknown) {
-      await markFailed(options.dependencies.stateStore, envelope, classifyHandlerError(error), true, options.dependencies.clock);
-      return retryOrDlq(envelope, "handler-error");
-    }
-  };
+  });
 }
 
 function livenessCheck(): RuntimeHealthCheck {
@@ -377,105 +373,6 @@ function shadowModeCheck(config: TranslationConfig): RuntimeHealthCheck {
   };
 }
 
-function retryOrDlq(
-  envelope: WorkerMessageEnvelope,
-  reason: string,
-  retryAfterMs?: number
-): RuntimeMessageProcessingResult {
-  const destination = getRetryDestination(envelope.route, envelope.attempt.count);
-
-  if ("ttlMs" in destination) {
-    if (retryAfterMs === undefined) {
-      return {
-        action: "retry",
-        reason,
-        envelope,
-        destination
-      };
-    }
-
-    return {
-      action: "retry",
-      reason,
-      envelope,
-      destination,
-      retryAfterMs
-    };
-  }
-
-  return {
-    action: "dlq",
-    reason,
-    envelope,
-    destination
-  };
-}
-
-function terminalResult(
-  envelope: WorkerMessageEnvelope,
-  reason: string,
-  issues?: readonly RuntimeValidationIssue[]
-): RuntimeMessageProcessingResult {
-  const destination = getRetryDestination(envelope.route, envelope.attempt.max);
-
-  if (issues === undefined) {
-    return {
-      action: "dlq",
-      reason,
-      envelope,
-      destination
-    };
-  }
-
-  return {
-    action: "dlq",
-    reason,
-    envelope,
-    destination,
-    issues
-  };
-}
-
-function toRuntimeValidationIssue(issue: StagePayloadValidationIssue | RuntimeValidationIssue): RuntimeValidationIssue {
-  return {
-    path: issue.path,
-    code: issue.code,
-    message: issue.message
-  };
-}
-
-async function markCompleted(
-  store: RuntimeIdempotencyStore,
-  envelope: WorkerMessageEnvelope,
-  clock: TranslationDependencies["clock"]
-): Promise<void> {
-  await store.markCompleted(envelope.idempotencyKey, {
-    completedAt: runtimeNow(clock),
-    messageId: envelope.messageId,
-    stage: "translation"
-  });
-}
-
-async function markFailed(
-  store: RuntimeIdempotencyStore,
-  envelope: WorkerMessageEnvelope,
-  reason: string,
-  retryable: boolean,
-  clock: TranslationDependencies["clock"]
-): Promise<void> {
-  await store.markFailed(envelope.idempotencyKey, {
-    failedAt: runtimeNow(clock),
-    messageId: envelope.messageId,
-    stage: "translation",
-    reason,
-    retryable
-  });
-}
-
-function classifyHandlerError(error: unknown): string {
-  if (error instanceof Error && error.name.length > 0) {
-    return error.name;
-  }
-
-  return "unknown-handler-error";
+function elapsedMs(clock: TranslationDependencies["clock"], startedAtMs: number): number {
+  return Math.max(0, clock.now().getTime() - startedAtMs);
 }

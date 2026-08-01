@@ -60,7 +60,7 @@ jobs:
       - name: Build container locally
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: docker build --pull=false --secret id=npm_token,env=NODE_AUTH_TOKEN -t nutsnews-worker-article-translation:${{ github.sha }} .
+        run: docker build --pull=false --build-arg BUILD_REVISION=${{ github.sha }} --secret id=npm_token,env=NODE_AUTH_TOKEN -t nutsnews-worker-article-translation:${{ github.sha }} .
 
       - name: Validate minimal runtime container
         run: |

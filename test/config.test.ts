@@ -18,6 +18,7 @@ describe("loadTranslationConfig", () => {
     expect(config).toMatchObject({
       serviceName: "nutsnews-worker-article-translation",
       dependencyMode: "test",
+      buildRevision: "development",
       host: "translation-host",
       concurrency: 2,
       prefetch: 4,
@@ -71,12 +72,22 @@ describe("loadTranslationConfig", () => {
         "NUTSNEWS_TRANSLATION_DATABASE_URL is required when NUTSNEWS_TRANSLATION_DEPENDENCY_MODE=production.",
         "NUTSNEWS_TRANSLATION_RABBITMQ_URL is required when NUTSNEWS_TRANSLATION_DEPENDENCY_MODE=production.",
         "NUTSNEWS_TRANSLATION_QWEN_BASE_URL is required when NUTSNEWS_TRANSLATION_DEPENDENCY_MODE=production.",
-        "NUTSNEWS_TRANSLATION_QWEN_API_KEY is required when NUTSNEWS_TRANSLATION_DEPENDENCY_MODE=production."
+        "NUTSNEWS_TRANSLATION_QWEN_API_KEY is required when NUTSNEWS_TRANSLATION_DEPENDENCY_MODE=production.",
+        "NUTSNEWS_TRANSLATION_BUILD_REVISION must be a lowercase 40-character Git commit SHA when NUTSNEWS_TRANSLATION_DEPENDENCY_MODE=production."
       ]);
       expect(configError.message).not.toContain("postgres://");
       expect(configError.message).not.toContain("amqp://");
       expect(configError.message).not.toContain("sk-");
     }
+  });
+
+  it("rejects in-memory dependency mode for the production environment", () => {
+    expect(() => loadTranslationConfig({
+      NUTSNEWS_ENVIRONMENT: "production",
+      NUTSNEWS_TRANSLATION_DEPENDENCY_MODE: "test"
+    })).toThrow(
+      "NUTSNEWS_TRANSLATION_DEPENDENCY_MODE must be production when NUTSNEWS_ENVIRONMENT=production."
+    );
   });
 
   it("rejects unsafe concurrency bounds and shadow cutover in this repo", () => {
@@ -127,6 +138,7 @@ describe("loadTranslationConfig", () => {
   it("accepts explicit production dependency presence without retaining sensitive values", () => {
     const config = loadTranslationConfig({
       NUTSNEWS_TRANSLATION_DEPENDENCY_MODE: "production",
+      NUTSNEWS_TRANSLATION_BUILD_REVISION: "0123456789abcdef0123456789abcdef01234567",
       NUTSNEWS_TRANSLATION_DATABASE_URL: "postgres://example.invalid/worker",
       NUTSNEWS_TRANSLATION_RABBITMQ_URL: "amqp://example.invalid",
       NUTSNEWS_TRANSLATION_QWEN_BASE_URL: "https://qwen.internal.invalid/v1",
@@ -140,6 +152,7 @@ describe("loadTranslationConfig", () => {
       qwenEndpointConfigured: true,
       qwenCredentialConfigured: true
     });
+    expect(config.buildRevision).toBe("0123456789abcdef0123456789abcdef01234567");
     expect(JSON.stringify(config)).not.toContain("postgres://example.invalid");
     expect(JSON.stringify(config)).not.toContain("amqp://example.invalid");
     expect(JSON.stringify(config)).not.toContain("qwen.internal.invalid");

@@ -143,8 +143,10 @@ describe("createArticleTranslationWorkHandler", () => {
     expect(context.metrics.collect()).toContain("nutsnews_translation_language_results_total");
     expect(context.metrics.collect()).toContain('language="fr"');
     expect(context.metrics.collect()).toContain('provider="local_ai"');
-    expect(context.metrics.collect()).toContain("nutsnews_translation_language_tokens_total");
-    expect(context.metrics.collect()).toContain('token_kind="total"');
+    expect(context.metrics.collect()).toContain("nutsnews_translation_language_input_tokens_total");
+    expect(context.metrics.collect()).toContain("nutsnews_translation_language_output_tokens_total");
+    expect(context.metrics.collect()).toContain("nutsnews_translation_language_total_tokens_total");
+    expect(context.metrics.collect()).not.toContain("token_kind=");
 
     const telemetryJson = JSON.stringify(context.telemetry.events);
 
@@ -221,8 +223,9 @@ describe("createArticleTranslationWorkHandler", () => {
       status: "success"
     });
     expect(persistenceCommands(context)).toHaveLength(1);
-    expect(context.metrics.collect()).toContain('result="retry"');
-    expect(context.metrics.collect()).toContain('retry="retryable"');
+    expect(context.metrics.collect()).toContain('outcome="retry"');
+    expect(context.metrics.collect()).not.toContain('result="retry"');
+    expect(context.metrics.collect()).not.toContain('retry="retryable"');
 
     context.qwenClient.errorsByLanguage.delete("ja");
 
@@ -253,6 +256,20 @@ describe("createArticleTranslationWorkHandler", () => {
       translationStatus: "complete",
       missingLanguageCodes: []
     });
+
+    const metrics = context.metrics.collect();
+    const successLabels = '{environment="local",language="fr",outcome="success",provider="local_ai",service="translation",stage="translation"}';
+    const duplicateLabels = '{environment="local",language="fr",outcome="duplicate",provider="local_ai",service="translation",stage="translation"}';
+    expect(metrics).toContain(`nutsnews_translation_language_results_total${successLabels} 1`);
+    expect(metrics).toContain(`nutsnews_translation_language_results_total${duplicateLabels} 1`);
+    expect(metrics).toContain(`nutsnews_translation_language_duration_seconds_count${successLabels} 1`);
+    expect(metrics).not.toContain(`nutsnews_translation_language_duration_seconds_count${duplicateLabels}`);
+    expect(metrics).toContain(`nutsnews_translation_language_input_tokens_total${successLabels} 120`);
+    expect(metrics).toContain(`nutsnews_translation_language_output_tokens_total${successLabels} 38`);
+    expect(metrics).toContain(`nutsnews_translation_language_total_tokens_total${successLabels} 158`);
+    expect(metrics).not.toContain(`nutsnews_translation_language_input_tokens_total${duplicateLabels}`);
+    expect(metrics).not.toContain(`nutsnews_translation_language_output_tokens_total${duplicateLabels}`);
+    expect(metrics).not.toContain(`nutsnews_translation_language_total_tokens_total${duplicateLabels}`);
   });
 
   it("bounds quality re-prompts and resumes without redoing earlier successful languages", async () => {
@@ -276,7 +293,7 @@ describe("createArticleTranslationWorkHandler", () => {
       targetLanguage: "fr",
       status: "success"
     });
-    expect(context.metrics.collect()).toContain('result="retry"');
+    expect(context.metrics.collect()).toContain('outcome="retry"');
 
     context.qwenClient.responsesByLanguage.delete("ja");
 
@@ -514,6 +531,53 @@ describe("createArticleTranslationWorkHandler", () => {
       missingLanguageCodes: []
     });
   });
+
+  it("keeps language persistence and publication semantics when work-handler telemetry throws or rejects", async () => {
+    const config = loadTranslationConfig({
+      NUTSNEWS_TRANSLATION_HTTP_PORT: "0",
+      NUTSNEWS_TRANSLATION_TELEMETRY_LOGS: "silent"
+    });
+    const clock = new ManualTranslationClock();
+    const baseDependencies = createLocalTranslationDependencies({
+      clock
+    });
+    let emissionCount = 0;
+    const dependencies = {
+      ...baseDependencies,
+      workHandler: createArticleTranslationWorkHandler({
+        config,
+        dependencies: baseDependencies,
+        telemetry: {
+          emit: () => {
+            emissionCount += 1;
+
+            if (emissionCount % 2 === 1) {
+              throw new Error("telemetry synchronous failure");
+            }
+
+            return Promise.reject(new Error("telemetry asynchronous failure"));
+          }
+        }
+      })
+    };
+    const service = createTranslationService({
+      config,
+      dependencies
+    });
+    const broker = dependencies.brokerTransport as LocalBrokerTransport;
+
+    await service.start();
+    await expect(broker.deliverTranslation()).resolves.toMatchObject({
+      action: "ack",
+      reason: "handled"
+    });
+    await service.stop();
+
+    expect(emissionCount).toBe(5);
+    expect((dependencies.stateStore as InMemoryTranslationStateStore).languageResults).toHaveLength(5);
+    expect(broker.published).toHaveLength(6);
+    expect((dependencies.brokerOutbox as LocalTranslationBrokerOutbox).records).toHaveLength(6);
+  });
 });
 
 function createTranslationContext() {
@@ -529,7 +593,8 @@ function createTranslationContext() {
       version: config.serviceVersion,
       environment: config.environment,
       host: config.host
-    }
+    },
+    expectedActive: !config.shadowMode
   });
   const telemetryAndMetrics = {
     emit: async (event: Parameters<typeof telemetry.emit>[0]) => {

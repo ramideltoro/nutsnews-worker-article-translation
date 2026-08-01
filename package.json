@@ -39,15 +39,10 @@
     "ci": "npm run lint && npm run typecheck && npm run test && npm run test:integration && npm run build && npm run sbom && npm run audit:prod"
   },
   "dependencies": {
-    "@ramideltoro/nutsnews-worker-contracts": "0.4.0",
-    "@ramideltoro/nutsnews-worker-runtime": "0.5.0",
+    "@ramideltoro/nutsnews-worker-contracts": "1.0.0",
+    "@ramideltoro/nutsnews-worker-runtime": "1.0.0",
     "amqplib": "^2.0.1",
     "pg": "^8.22.0"
-  },
-  "overrides": {
-    "@ramideltoro/nutsnews-worker-runtime": {
-      "@ramideltoro/nutsnews-worker-contracts": "0.4.0"
-    }
   },
   "devDependencies": {
     "@eslint/js": "^9.32.0",

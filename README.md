@@ -19,11 +19,25 @@ The worker records one independently replayable result per article version, sour
 - Exposes `publishTranslationBacklogRecoveryTask` for reconciliation jobs to republish idempotent `backlog_recovery` translation tasks from durable language-result state without redoing valid languages.
 - Provides injectable Qwen client, prompt registry, language policy, quality validator, durable state, transaction, outbox, broker, and work-handler boundaries.
 - Configures low default prefetch and concurrency, plus per-language concurrency for Qwen-bound translation work.
-- Uses shared runtime broker lifecycle, in-flight drain, idempotency store, retry/DLQ destinations, health reports, and Prometheus metrics.
-- Exposes runtime metrics plus bounded per-language translation metrics for provider, language, result, retry class, latency, and token counts.
-- Keeps liveness independent from Qwen, prompt registry, language policy, and quality validator readiness; `/live` only checks process health, while `/ready` gates an active `translation` main-queue consumer, broker, state, outbox, Qwen, prompt registry, language policy, quality validator, and shadow mode.
+- Uses shared runtime broker lifecycle, in-flight drain, idempotency store, retry/DLQ destinations, health reports, and Prometheus metrics. Its consumer-aware processor emits exactly one accepted, duplicate, invalid, retry, or DLQ completion for every started delivery.
+- Exposes the canonical `nutsnews_worker_uplift_stage_events_total` lifecycle counter and fixed-bucket `nutsnews_worker_uplift_stage_latency_seconds` histogram, plus bounded per-language outcome and duration metrics and separate input/output/total token counters.
+- Pins the published Contracts `1.0.0` and Runtime `1.0.0` pair exactly; the lock records immutable GitHub Packages URLs and SHA-512 integrity for both packages.
+- Uses Runtime 1.0 token-owned idempotency transitions. PostgreSQL-authoritative claims carry a strict five-minute bounded lease, renew every minute through a single-flight token compare-and-set, reclaim only expired/failed claims, and preserve completed records when completion acknowledgement is ambiguous. A hard three-and-a-half-minute processing deadline, abort-aware Qwen calls, transaction commit guards, and bounded PostgreSQL operations fail work closed before an unrenewed lease can be reclaimed.
+- Keeps liveness independent from Qwen, prompt registry, language policy, and quality validator readiness; `/live` and `/livez` only check process health, while `/ready` gates an active `translation` main-queue consumer, broker, state, outbox, Qwen, prompt registry, language policy, quality validator, and shadow mode.
 - Emits bounded structured events and Prometheus metrics when RabbitMQ cancels the consumer, drops its channel, or restores consumption.
 - Contains no approval decision, article persistence, or publication logic.
+
+## Metrics contract
+
+`/metrics` delegates core telemetry ownership to the Runtime 1.0 Prometheus sink. Runtime is the sole source of build/deployment identity, `nutsnews_worker_expected_active`, `nutsnews_worker_last_success_timestamp_seconds`, `nutsnews_worker_consumers`, liveness/startup/readiness probes, bounded health checks and their fixed-bucket durations, processing/dependency histograms, and shutdown state. Expected activity is derived from the configured shadow mode. Last-success is initialized to zero and advances monotonically from the event timestamp of accepted work or an already-completed duplicate; older completion events cannot move it backward. The canonical health-check allowlist covers every liveness, startup, and production-readiness check, so emitted checks do not collapse into the `other` label. Cancellation and shutdown trigger complete readiness/startup evaluations to keep aggregate probe status coherent with per-check gauges.
+
+The translation sink adds only bounded service-specific families: `nutsnews_worker_uplift_stage_events_total{environment,service,outcome}`, `nutsnews_worker_uplift_stage_latency_seconds{environment,service}`, and the per-language translation result, latency, and token families. A delivery contributes one completion outcome (`success`, `duplicate`, `invalid`, `retry`, `dlq`, or `failure`) and, when measured, one latency observation. All six bounded outcome series are seeded at zero so collection completeness is independently observable. The fixed cumulative buckets are `0.005`, `0.01`, `0.025`, `0.05`, `0.1`, `0.25`, `0.5`, `1`, `2.5`, `5`, `10`, `30`, `60`, `120`, and `300` seconds, followed by `+Inf`, `_sum`, and `_count`.
+
+Per-language metrics use only `environment`, `service`, `stage`, `outcome`, `language`, and `provider`. Languages are restricted to the reviewed `fr`, `ja`, `de-CH`, `de`, and `el` metric allowlist and the provider allowlist contains only `local_ai`; all other values collapse to `unknown`. Message, article, pipeline, correlation, trace, idempotency, model, and prompt identifiers remain structured log fields and are never Prometheus labels.
+
+Runtime 1.0 removes the generic `_duration_ms` summaries. All events are delegated to Runtime; dependency events with a measured duration, including a truthful zero, contribute to its `_duration_seconds` histogram, while duration-less configuration events contribute no latency sample. Translation-owned latency metrics also remain fixed-bucket seconds histograms.
+
+Telemetry delivery is best effort at both fan-out and service boundaries. A synchronous sink failure, rejected emission, or metrics-setter error cannot change idempotency state, acknowledgement, retry, or DLQ behavior.
 
 ## Configuration
 
@@ -31,6 +45,7 @@ The HTTP server exposes `/config-schema` with names, defaults, sensitivity, and 
 
 | Variable | Default | Production | Sensitive |
 | --- | --- | --- | --- |
+| `NUTSNEWS_TRANSLATION_BUILD_REVISION` | `development` | required lowercase 40-character Git SHA | no |
 | `NUTSNEWS_TRANSLATION_DATABASE_URL` | unset | required | yes |
 | `NUTSNEWS_TRANSLATION_RABBITMQ_URL` | unset | required | yes |
 | `NUTSNEWS_TRANSLATION_QWEN_BASE_URL` | unset | required | yes |

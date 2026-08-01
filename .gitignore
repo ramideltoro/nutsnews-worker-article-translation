@@ -1,6 +1,7 @@
 node_modules/
 dist/
 coverage/
+*.sbom.json
 .env
 .env.*
 !.env.example
