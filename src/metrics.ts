@@ -95,7 +95,8 @@ const TRANSLATION_STAGE_OUTCOMES = [
   "duplicate",
   "invalid",
   "retry",
-  "dlq"
+  "dlq",
+  "failure"
 ] as const;
 const HEALTH_PROBES = [
   "liveness",

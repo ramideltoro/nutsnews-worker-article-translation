@@ -48,14 +48,15 @@ describe("translation lifecycle telemetry", () => {
     const initialStageSamples = canonicalStageSampleLines(initial);
 
     expect(context.metrics.collect()).toBe(initial);
-    expect(initialStageSamples).toHaveLength(5 + TRANSLATION_DURATION_BUCKETS_SECONDS.length + 3);
+    expect(initialStageSamples).toHaveLength(6 + TRANSLATION_DURATION_BUCKETS_SECONDS.length + 3);
     expect(initialStageSamples.every((line) => line.endsWith(" 0"))).toBe(true);
     expect(new Set(stageOutcomesFromMetrics(initial))).toEqual(new Set([
       "success",
       "duplicate",
       "invalid",
       "retry",
-      "dlq"
+      "dlq",
+      "failure"
     ]));
     expect(histogramBoundaries(initial)).toEqual([
       ...TRANSLATION_DURATION_BUCKETS_SECONDS.map(String),
