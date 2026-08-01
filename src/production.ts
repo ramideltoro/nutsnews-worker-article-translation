@@ -178,7 +178,8 @@ export function createProductionTranslationDependencies(
   const qwenClient = new LocalAiTranslationQwenClient({
     baseUrl: requiredEnv(env, "NUTSNEWS_TRANSLATION_QWEN_BASE_URL"),
     apiKey: requiredEnv(env, "NUTSNEWS_TRANSLATION_QWEN_API_KEY"),
-    clock: options.clock
+    clock: options.clock,
+    sourcePool: pool
   });
 
   return {
@@ -2231,21 +2232,31 @@ export class LocalAiTranslationQwenClient implements TranslationQwenClient {
   private readonly apiKey: string;
   private readonly clock: RuntimeClock;
   private readonly fetcher: FetchLike;
+  private readonly sourcePool: Pool | undefined;
 
   constructor(options: {
     readonly baseUrl: string;
     readonly apiKey: string;
     readonly clock: RuntimeClock;
     readonly fetcher?: FetchLike;
+    readonly sourcePool?: Pool;
   }) {
     this.baseUrl = stripTrailingSlashes(options.baseUrl);
     this.apiKey = options.apiKey;
     this.clock = options.clock;
     this.fetcher = options.fetcher ?? fetch;
+    this.sourcePool = options.sourcePool;
   }
 
   async probe(): Promise<TranslationDependencyProbe> {
     try {
+      if (this.sourcePool !== undefined) {
+        await this.sourcePool.query(
+          `SELECT canonical_url, title, source_summary, category
+           FROM worker_uplift_views.approval_projection
+           LIMIT 0`
+        );
+      }
       const response = await this.fetcher(`${this.baseUrl}/health`, {
         method: "GET",
         signal: AbortSignal.timeout(5_000)
@@ -2278,6 +2289,7 @@ export class LocalAiTranslationQwenClient implements TranslationQwenClient {
     }
 
     const startedAtMs = this.clock.now().getTime();
+    const source = await this.loadApprovedSource(request);
     let response: Response;
     const requestTimeoutSignal = AbortSignal.timeout(request.timeoutMs);
     const signal = request.signal === undefined
@@ -2298,10 +2310,10 @@ export class LocalAiTranslationQwenClient implements TranslationQwenClient {
           model: request.model,
           language_code: request.input.targetLanguage,
           language_name: languageName(request.input.targetLanguage),
-          source: "NutsNews worker uplift",
-          title: `NutsNews shadow article ${request.input.articleId}`,
-          summary: shadowSourceSummary(request.input.articleId),
-          category: "Uplifting"
+          source: source.source,
+          title: source.title,
+          summary: source.summary,
+          category: source.category
         }),
         signal
       });
@@ -2326,6 +2338,54 @@ export class LocalAiTranslationQwenClient implements TranslationQwenClient {
     const raw = await response.json();
 
     return mapLocalAiTranslation(raw, Math.max(0, this.clock.now().getTime() - startedAtMs));
+  }
+
+  private async loadApprovedSource(request: TranslationQwenRequest): Promise<{
+    readonly source: string;
+    readonly title: string;
+    readonly summary: string;
+    readonly category: string;
+  }> {
+    if (this.sourcePool === undefined) {
+      return {
+        source: "NutsNews worker uplift",
+        title: `NutsNews shadow article ${request.input.articleId}`,
+        summary: shadowSourceSummary(request.input.articleId),
+        category: "Uplifting"
+      };
+    }
+
+    const result = await this.sourcePool.query<{
+      readonly canonical_url: string | null;
+      readonly title: string | null;
+      readonly source_summary: string | null;
+      readonly category: string | null;
+    }>(
+      `SELECT canonical_url, title, source_summary, category
+       FROM worker_uplift_views.approval_projection
+       WHERE article_identity_hash = $1
+         AND approval_version = $2
+         AND decision = 'approved'
+       LIMIT 1`,
+      [request.input.articleId, request.input.articleVersion]
+    );
+    const row = result.rows[0];
+    const title = row?.title?.trim() ?? "";
+    const summary = row?.source_summary?.trim() ?? "";
+    const category = row?.category?.trim() ?? "";
+
+    if (row === undefined || title.length === 0 || summary.length === 0 || category.length === 0) {
+      throw new TranslationQwenError("qwen-model-error", {
+        retryable: true
+      });
+    }
+
+    return {
+      source: sourceName(row.canonical_url),
+      title,
+      summary,
+      category
+    };
   }
 }
 
@@ -2845,6 +2905,20 @@ function shadowSourceSummary(articleId: string): string {
   return `Approved NutsNews article ${articleId} is running through shadow translation validation. This bounded summary proves local AI, queue, and stage-state behavior without publishing reader-facing content.`;
 }
 
+function sourceName(value: string | null): string {
+  if (value === null) {
+    return "NutsNews";
+  }
+
+  try {
+    const hostname = new URL(value).hostname.replace(/^www\./u, "");
+
+    return hostname.length > 0 ? hostname : "NutsNews";
+  } catch {
+    return "NutsNews";
+  }
+}
+
 function sha256Json(value: unknown): string {
   return `sha256:${createHash("sha256").update(JSON.stringify(value)).digest("hex")}`;
 }
@@ -3093,7 +3167,8 @@ function isTranslationResultSnapshot(value: unknown): value is TranslationStored
     && (value.status === "success" || value.status === "permanent_failure")
     && typeof value.model === "string"
     && typeof value.promptId === "string"
-    && typeof value.promptVersion === "string";
+    && typeof value.promptVersion === "string"
+    && (value.status !== "success" || (typeof value.summary === "string" && value.summary.trim().length > 0));
 }
 
 function isReplayableTranslationResultSnapshot(value: unknown): value is TranslationStoredLanguageResult {
@@ -3111,7 +3186,7 @@ function isReplayableTranslationResultSnapshot(value: unknown): value is Transla
     return false;
   }
 
-  return value.status === "success" ? value.summaryRef !== undefined : true;
+  return value.status === "success" ? value.summaryRef !== undefined && value.summary !== undefined : true;
 }
 
 function orderedSummaryRef(

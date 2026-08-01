@@ -537,6 +537,9 @@ function storedLanguageResult(
     ...(values.failureReason === undefined ? {} : {
       failureReason: values.failureReason
     }),
+    ...(values.summary === undefined ? {} : {
+      summary: values.summary
+    }),
     ...(summaryRef === undefined ? {} : {
       summaryRef
     }),

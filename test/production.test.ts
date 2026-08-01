@@ -64,22 +64,38 @@ describe("production translation dependencies", () => {
   });
 
   it("maps the legacy local AI translation response into a translation result", async () => {
-    const fetcher = vi.fn(() => Promise.resolve(new Response(JSON.stringify({
-      language_code: "fr",
-      title: "Bibliotheques de quartier",
-      summary: "Des eleves creent des boites a livres pour leur quartier, donnant aux familles un acces plus simple a des lectures positives.",
-      prompt_tokens: 120,
-      completion_tokens: 38,
-      total_tokens: 158,
-      duration_ms: 4210
-    }), {
-      status: 200
-    })));
+    const sourceQuery = vi.fn(() => Promise.resolve({
+      rowCount: 1,
+      rows: [{
+        canonical_url: "https://publisher.example.test/community/library",
+        title: "Neighbors build a free community library",
+        source_summary: "Neighbors created a free library that gives local families easier access to books.",
+        category: "Community | Uplifting"
+      }]
+    }));
+    const fetcher = vi.fn((_input: string, _init?: RequestInit) => {
+      void _input;
+      void _init;
+      return Promise.resolve(new Response(JSON.stringify({
+        language_code: "fr",
+        title: "Bibliotheques de quartier",
+        summary: "Des eleves creent des boites a livres pour leur quartier, donnant aux familles un acces plus simple a des lectures positives.",
+        prompt_tokens: 120,
+        completion_tokens: 38,
+        total_tokens: 158,
+        duration_ms: 4210
+      }), {
+        status: 200
+      }));
+    });
     const client = new LocalAiTranslationQwenClient({
       baseUrl: "https://ai.example.test/",
       apiKey: "local-key",
       clock,
-      fetcher
+      fetcher,
+      sourcePool: {
+        query: sourceQuery
+      } as unknown as Pool
     });
 
     await expect(client.translate(translationRequest())).resolves.toMatchObject({
@@ -99,6 +115,24 @@ describe("production translation dependencies", () => {
         "x-nutsnews-ai-key": "local-key"
       }
     }));
+    const request = fetcher.mock.calls[0]?.[1];
+
+    if (typeof request?.body !== "string") {
+      throw new Error("translation request body was not JSON text");
+    }
+
+    const body = JSON.parse(request.body) as Readonly<Record<string, unknown>>;
+
+    expect(sourceQuery).toHaveBeenCalledWith(expect.stringContaining("worker_uplift_views.approval_projection"), [
+      "article-001",
+      1
+    ]);
+    expect(body).toMatchObject({
+      source: "publisher.example.test",
+      title: "Neighbors build a free community library",
+      summary: "Neighbors created a free library that gives local families easier access to books.",
+      category: "Community | Uplifting"
+    });
   });
 
   it("fails closed before calling local AI when the API key is not a valid header", async () => {
