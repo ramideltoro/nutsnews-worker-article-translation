@@ -1158,7 +1158,9 @@ export class PostgresTranslationOutboxReconciler implements TranslationReconcile
     row: TranslationOutboxRow,
     diagnostic: Readonly<Record<string, unknown>>
   ): Promise<RecoveryResult> {
-    if (isRecord(diagnostic.envelope)) {
+    if (isRecord(diagnostic.envelope)
+      && isRecord(diagnostic.payload)
+      && row.payload_digest === sha256Json(diagnostic.payload)) {
       return {
         status: "not_applicable"
       };
