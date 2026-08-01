@@ -126,6 +126,8 @@ export interface TranslationStoredLanguageResult extends TranslationLanguageResu
   readonly resultId: string;
   readonly status: "success" | "permanent_failure";
   readonly failureReason?: string;
+  readonly title?: string;
+  readonly summary?: string;
   readonly summaryRef?: {
     readonly kind: "backend-record";
     readonly uri: string;

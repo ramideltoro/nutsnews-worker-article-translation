@@ -568,6 +568,8 @@ function storedResultSnapshot(): TranslationStoredLanguageResult {
     promptVersion: "0.1.0",
     model: "qwen2.5:3b",
     status: "success",
+    title: "Bibliothèque gratuite du quartier",
+    summary: "Des voisins créent une bibliothèque gratuite pour les familles du quartier.",
     summaryRef: {
       kind: "backend-record",
       uri: `backend://worker-uplift/translation/article-001/${resultId}/fr/summary`,
