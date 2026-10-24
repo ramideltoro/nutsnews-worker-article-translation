@@ -60,7 +60,7 @@ jobs:
 
       - name: Autobuild
         if: steps.source.outputs.has_code == 'true'
-        uses: github/codeql-action/autobuild@f205ea1c3313d32999d8d6a48b4f6530d4437b38  # v4
+        uses: github/codeql-action/autobuild@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd  # v4
 
       - name: Analyze
         if: steps.source.outputs.has_code == 'true'
