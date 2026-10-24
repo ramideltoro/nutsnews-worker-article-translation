@@ -47,7 +47,7 @@
   "devDependencies": {
     "@eslint/js": "^9.32.0",
     "@types/amqplib": "^0.10.8",
-    "@types/node": "^24.1.0",
+    "@types/node": "^26.1.2",
     "@types/pg": "^8.20.0",
     "eslint": "^9.32.0",
     "typescript": "^5.8.3",
